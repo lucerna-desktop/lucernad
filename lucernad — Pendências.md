@@ -22,6 +22,7 @@ Da seção "Separação da lógica" das Pendências do shell (decisão de 2026-1
 
 Ligados a itens de outros repositórios:
 
+- [ ] **Bloqueio confiável pelo logind** (marco 1 do roteiro até o uso diário, nas Pendências do `lucerna-shell`): escutar o `PrepareForSleep` e o `Lock`/`Unlock` do logind e segurar um *delay inhibitor* até o shell confirmar que a tela de bloqueio está desenhada. Hoje fechar a tampa, `loginctl lock-session` e suspender por fora não bloqueiam. Falta decidir se vira um módulo do `lucernad` (que publica o evento) ou se o shell escuta o D-Bus direto; de qualquer jeito, o `lucernad` não pode depender do shell para dormir.
 - [ ] **Migrar para o `connect_or_spawn` e o agendador do SDK** quando o `lucernad` passar a usar o `lucerna-service` por inteiro, com spec próprio (do "Trabalho seguinte" do plano do serviço sem systemd, lucerna-sdk#14).
 - O **tema gerado a partir do papel de parede** (Material 3 a partir da imagem, guardado pelo hash do arquivo; num vídeo, por um quadro) é do `lucernad`, mas o projeto todo está no item 17 das Pendências do `lucerna-shell`, com spec próprio.
 - O **módulo de discos** (aviso de pendrive, ejetar), sem depender do explorador, está na v3 do [spec do `lucerna-files`](https://github.com/lucerna-desktop/lucerna-files/blob/main/docs/superpowers/specs/2026-10-27-explorador-design.md).
@@ -30,6 +31,7 @@ Ligados a itens de outros repositórios:
 ## Pacote
 
 - [ ] **Pacote do `lucernad`:** um PKGBUILD neste repositório. Hoje ele é instalado à mão pelos comandos do README e precisa ser recompilado e reinstalado a cada merge. O AUR e as outras distros estão no item 14 das Pendências do `lucerna-shell`.
+- [ ] **Versões casadas com o shell:** o pacote do shell pede uma versão mínima do `lucernad` (hoje o casamento é o `dev/lucernad.rev` do shell), então os dois repositórios ganham tags e releases juntos; o `CHANGELOG` vem com elas. Parte do marco 6 do roteiro nas Pendências do `lucerna-shell`.
 
 ## Sobras do módulo de sistema
 
