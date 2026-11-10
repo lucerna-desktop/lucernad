@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use lucerna_service::{RpcError, ServerBuilder, Topic};
 use lucernad_core::{
-    Detached, GameSignal, ModuleTask, detached, detached_task, publish_changed, spawn_thread,
+    Detached, GameSignal, ModuleTask, Spawn, detached, detached_task, publish_changed, spawn_thread,
 };
 use serde_json::{Value, json};
 use tokio::sync::{oneshot, watch};
@@ -68,6 +68,8 @@ pub struct SpectrumConfig {
     pub retry: Duration,
     /// O sinal do modo jogo: ligado, a captura pausa.
     pub game: GameSignal,
+    /// Cria as threads do casamento (o `spawn_thread`; os testes contam).
+    pub spawn: Spawn,
 }
 
 impl SpectrumConfig {
@@ -80,6 +82,7 @@ impl SpectrumConfig {
             dbus_timeout: DBUS_TIMEOUT,
             retry: RETRY,
             game: GameSignal::never(),
+            spawn: spawn_thread,
         }
     }
 }
@@ -224,6 +227,12 @@ struct Module {
     player: watch::Receiver<Option<String>>,
     status: Status,
     game: GameSignal,
+    /// O casamento em voo, que atravessa as sessões: no máximo uma thread
+    /// lendo o `/proc` no processo, mesmo com ele travado.
+    pending: Option<Pending>,
+    /// Sobe a cada sessão e a cada troca de player: o casamento de uma época
+    /// anterior é descartado.
+    epoch: u64,
 }
 
 impl Module {
@@ -345,6 +354,8 @@ impl Module {
             mut events,
             control,
         } = session;
+        // Um casamento de uma sessão anterior ainda em voo não vale aqui.
+        self.epoch += 1;
         let mut capture = Capture {
             control,
             identity: self.identify(&name).await,
@@ -352,8 +363,6 @@ impl Module {
             matched: Vec::new(),
             rings: Rings::new(),
             analyzer: None,
-            epoch: 0,
-            pending: None,
             wanted: false,
         };
         let mut tick = tokio::time::interval(FRAME);
@@ -371,11 +380,12 @@ impl Module {
                     capture.identity = self.identify(&name).await;
                     self.request_rematch(&mut capture);
                 }
-                (epoch, result) = rematch_done(&mut capture.pending), if capture.pending.is_some() => {
-                    capture.pending = None;
+                (epoch, result) = rematch_done(&mut self.pending), if self.pending.is_some() => {
+                    self.pending = None;
                     match result {
-                        // Um casamento de um player anterior não vale mais.
-                        Ok(Ok(matched)) if epoch == capture.epoch => self.apply(&mut capture, matched),
+                        // Um casamento de um player ou de uma sessão anterior
+                        // não vale mais.
+                        Ok(Ok(matched)) if epoch == self.epoch => self.apply(&mut capture, matched),
                         Ok(Ok(_)) => {}
                         Ok(Err(p)) => resume_unwind(p),
                         // O `catch_unwind` sempre responde; sem resposta, a
@@ -402,7 +412,7 @@ impl Module {
                     name = new;
                     // Larga a captura do player anterior já: um /proc lento
                     // não pode deixar as barras seguindo outro app.
-                    capture.epoch += 1;
+                    self.epoch += 1;
                     capture.rings.clear();
                     self.apply(&mut capture, Vec::new());
                     capture.identity = self.identify(&name).await;
@@ -421,15 +431,16 @@ impl Module {
 
     /// Pede um casamento novo; ele começa já ou quando o que está em voo
     /// terminar.
-    fn request_rematch(&self, capture: &mut Capture) {
+    fn request_rematch(&mut self, capture: &mut Capture) {
         capture.wanted = true;
         self.start_rematch(capture);
     }
 
-    /// Começa o casamento pedido, se nenhum está em voo: no máximo uma
-    /// thread lendo o `/proc` por vez, mesmo com ele travado.
-    fn start_rematch(&self, capture: &mut Capture) {
-        if capture.pending.is_some() || !capture.wanted {
+    /// Começa o casamento pedido, se nenhum está em voo (desta sessão ou de
+    /// uma anterior): no máximo uma thread lendo o `/proc` por vez, mesmo com
+    /// ele travado.
+    fn start_rematch(&mut self, capture: &mut Capture) {
+        if self.pending.is_some() || !capture.wanted {
             return;
         }
         capture.wanted = false;
@@ -437,8 +448,8 @@ impl Module {
         let nodes = capture.nodes.clone();
         let procfs = self.cfg.procfs.clone();
         let job = move || match_nodes(&identity, &nodes, &ProcFs::new(procfs));
-        match detached_task(spawn_thread, job) {
-            Ok(rx) => capture.pending = Some((capture.epoch, rx)),
+        match detached_task(self.cfg.spawn, job) {
+            Ok(rx) => self.pending = Some((self.epoch, rx)),
             // Sem thread, fica o casamento anterior até o próximo pedido.
             Err(e) => eprintln!("lucernad: não consegui criar a thread do casamento: {e}"),
         }
@@ -478,11 +489,6 @@ struct Capture {
     rings: Rings,
     /// A análise e a taxa para a qual ela foi criada.
     analyzer: Option<(u32, Analyzer)>,
-    /// Sobe a cada troca de player: o casamento de uma época anterior é
-    /// descartado.
-    epoch: u64,
-    /// O casamento em voo.
-    pending: Option<Pending>,
     /// Um casamento foi pedido com outro em voo: refazer quando ele acabar.
     wanted: bool,
 }
@@ -530,6 +536,8 @@ async fn run(cfg: SpectrumConfig, t: SpectrumTopics, player: Arc<watch::Sender<O
         player: player.subscribe(),
         status: Status::default(),
         game,
+        pending: None,
+        epoch: 0,
     };
     m.probe().await;
     loop {
