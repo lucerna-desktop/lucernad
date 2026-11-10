@@ -12,6 +12,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
+use std::sync::Mutex;
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
@@ -43,8 +44,13 @@ pub fn disconnected(message: &str, res: i32) -> String {
     format!("O PipeWire fechou a conexão: {message} ({res}).")
 }
 
-/// A espera para reabrir um fluxo que o servidor destruiu.
+/// A espera para reabrir um fluxo que o servidor destruiu (ou que nem abriu):
+/// dobra a cada falha seguida do mesmo nó, até [`MAX_REOPEN_DELAY`].
 const REOPEN_DELAY: Duration = Duration::from_millis(500);
+/// O teto da espera do [`REOPEN_DELAY`]: um alvo que o WirePlumber sempre
+/// recusa é tentado de novo só a cada tanto, sem parar de vez (a recusa pode
+/// passar).
+const MAX_REOPEN_DELAY: Duration = Duration::from_secs(8);
 /// O passo do timer que confere os fluxos destruídos.
 const TICK: Duration = Duration::from_millis(100);
 /// A classe dos nós de saída de áudio dos apps.
@@ -53,17 +59,40 @@ const OUTPUT_CLASS: &str = "Stream/Output/Audio";
 /// O PipeWire como [`Backend`].
 pub struct PipeWire {
     /// O `remote.name` da conexão; `None` é o servidor padrão.
-    pub remote: Option<String>,
+    remote: Option<String>,
     /// O prazo para a conexão responder.
-    pub timeout: Duration,
+    timeout: Duration,
+    /// Fecha quando a thread da última sessão (ou da sonda) termina.
+    previous: Mutex<Option<std_mpsc::Receiver<()>>>,
 }
 
 impl PipeWire {
+    /// O servidor `remote` (`None` é o padrão), com `timeout` para a conexão
+    /// responder.
+    pub fn new(remote: Option<String>, timeout: Duration) -> PipeWire {
+        PipeWire {
+            remote,
+            timeout,
+            previous: Mutex::new(None),
+        }
+    }
+
     /// O servidor do usuário, com o [`CONNECT_TIMEOUT`].
     pub fn system() -> PipeWire {
-        PipeWire {
-            remote: None,
-            timeout: CONNECT_TIMEOUT,
+        PipeWire::new(None, CONNECT_TIMEOUT)
+    }
+
+    /// Espera a thread da sessão anterior terminar, até o `timeout`: com as
+    /// duas ao mesmo tempo, os fluxos da velha ainda estariam no grafo
+    /// quando a nova liga os dela.
+    fn wait_previous(&self) {
+        let previous = self
+            .previous
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(done) = previous {
+            let _ = done.recv_timeout(self.timeout);
         }
     }
 }
@@ -75,14 +104,21 @@ impl Backend for PipeWire {
     }
 
     fn open(&self) -> Result<Session, String> {
+        self.wait_previous();
         let (events_tx, events) = mpsc::unbounded_channel();
         let (commands, commands_rx) = pw::channel::channel();
         let (ready_tx, ready) = std_mpsc::channel();
+        let (done, done_rx) = std_mpsc::channel();
         let (remote, timeout) = (self.remote.clone(), self.timeout);
         std::thread::Builder::new()
             .name("lucernad-pipewire".into())
-            .spawn(move || run(remote, timeout, events_tx, commands_rx, ready_tx))
+            .spawn(move || {
+                run(remote, timeout, events_tx, commands_rx, ready_tx);
+                // Só depois de desmontar tudo.
+                drop(done);
+            })
             .map_err(|e| connect_error(&e))?;
+        *self.previous.lock().unwrap_or_else(|e| e.into_inner()) = Some(done_rx);
 
         // A thread tem o prazo dela; este é a reserva se ela travar antes.
         match ready.recv_timeout(timeout + Duration::from_secs(1)) {
@@ -138,20 +174,43 @@ struct NodeGlobal {
     client: Option<u32>,
 }
 
-/// Um client ligado por `registry.bind`, com o que o info dele trouxe.
-struct ClientEntry {
-    _listener: ClientListener,
-    _proxy: Client,
+/// O que o info de um client trouxe.
+#[derive(Default)]
+struct ClientInfo {
     pid: Option<u32>,
     binary: Option<String>,
+}
+
+/// Um client ligado por `registry.bind`.
+struct ClientBinding {
+    _listener: ClientListener,
+    _proxy: Client,
+}
+
+/// Um fluxo de captura, no que o [`State`] precisa.
+trait Stream {
+    /// O servidor destruiu o fluxo ou ele deu erro.
+    fn failed(&self) -> bool;
+    /// O fluxo já chegou a rodar.
+    fn streamed(&self) -> bool;
 }
 
 /// Um fluxo de captura aberto. O ouvinte sai antes do fluxo.
 struct Capture {
     _listener: StreamListener<Format>,
     _stream: StreamRc,
-    /// O servidor destruiu o fluxo ou ele deu erro.
     failed: Rc<Cell<bool>>,
+    streamed: Rc<Cell<bool>>,
+}
+
+impl Stream for Capture {
+    fn failed(&self) -> bool {
+        self.failed.get()
+    }
+
+    fn streamed(&self) -> bool {
+        self.streamed.get()
+    }
 }
 
 /// O formato negociado de um fluxo.
@@ -161,21 +220,46 @@ struct Format {
     channels: usize,
 }
 
-/// O estado da sessão, dentro da thread do PipeWire.
-#[derive(Default)]
-struct State {
+/// O estado da sessão, dentro da thread do PipeWire: os fluxos `S` e as
+/// ligações `B` dos clients (nos testes, dublês).
+struct State<S, B> {
     nodes: BTreeMap<u32, NodeGlobal>,
-    clients: HashMap<u32, ClientEntry>,
+    clients: HashMap<u32, ClientInfo>,
+    bindings: HashMap<u32, B>,
     /// O conjunto do último `capture`.
     wanted: BTreeSet<u64>,
-    captures: HashMap<u64, Capture>,
+    captures: HashMap<u64, S>,
     /// Quando reabrir um fluxo destruído.
     retry: HashMap<u64, Instant>,
+    /// As falhas seguidas de cada nó, desde o último fluxo que rodou.
+    failures: HashMap<u64, u32>,
     /// O último `Graph` mandado.
     graph: Option<Vec<OutputNode>>,
 }
 
-impl State {
+impl<S, B> Default for State<S, B> {
+    fn default() -> State<S, B> {
+        State {
+            nodes: BTreeMap::new(),
+            clients: HashMap::new(),
+            bindings: HashMap::new(),
+            wanted: BTreeSet::new(),
+            captures: HashMap::new(),
+            retry: HashMap::new(),
+            failures: HashMap::new(),
+            graph: None,
+        }
+    }
+}
+
+/// A espera depois da falha número `failures` (a partir de 1) seguida.
+fn reopen_delay(failures: u32) -> Duration {
+    REOPEN_DELAY
+        .saturating_mul(1 << failures.saturating_sub(1).min(16))
+        .min(MAX_REOPEN_DELAY)
+}
+
+impl<S: Stream, B> State<S, B> {
     fn output_nodes(&self) -> Vec<OutputNode> {
         self.nodes
             .iter()
@@ -200,45 +284,83 @@ impl State {
         }
     }
 
+    /// Um objeto saiu do registro: um nó ou um client (os nós dele ficam sem
+    /// o PID e o binário, então o grafo muda).
+    fn remove_global(&mut self, id: u32, events: &UnboundedSender<Event>) {
+        let node = self.nodes.remove(&id).is_some();
+        self.bindings.remove(&id);
+        let client = self.clients.remove(&id).is_some();
+        if node || client {
+            self.send_graph(events);
+        }
+    }
+
+    /// Mais uma falha seguida do nó `serial`: a próxima tentativa sai depois
+    /// do [`reopen_delay`].
+    fn failed(&mut self, serial: u64, now: Instant) {
+        let failures = self.failures.entry(serial).or_default();
+        *failures += 1;
+        let delay = reopen_delay(*failures);
+        if *failures == 1 || (delay == MAX_REOPEN_DELAY && reopen_delay(*failures - 1) < delay) {
+            let secs = format!("{}", delay.as_secs_f32()).replace('.', ",");
+            eprintln!(
+                "lucernad: a captura do nó {serial} não ligou ({} vez(es)); nova tentativa a cada {secs} s",
+                failures
+            );
+        }
+        self.retry.insert(serial, now + delay);
+    }
+
     /// Deixa os fluxos como o `wanted` pede: fecha os que saíram (do pedido
-    /// ou do grafo), larga os que o servidor destruiu e abre os que faltam,
-    /// só para nós que estão no grafo.
-    fn reconcile(&mut self, core: &CoreRc, events: &UnboundedSender<Event>) {
-        let now = Instant::now();
+    /// ou do grafo), larga os que o servidor destruiu e abre por `open` os
+    /// que faltam, só para nós que estão no grafo.
+    fn reconcile(&mut self, now: Instant, open: &mut dyn FnMut(u64) -> Option<S>) {
         let in_graph: BTreeSet<u64> = self.nodes.values().map(|n| n.serial).collect();
         let wanted = &self.wanted;
         self.captures
             .retain(|serial, _| wanted.contains(serial) && in_graph.contains(serial));
         self.retry.retain(|serial, _| wanted.contains(serial));
+        self.failures.retain(|serial, _| wanted.contains(serial));
 
-        let failed: Vec<u64> = self
-            .captures
-            .iter()
-            .filter(|(_, c)| c.failed.get())
-            .map(|(&serial, _)| serial)
-            .collect();
+        let mut failed = Vec::new();
+        for (&serial, capture) in &self.captures {
+            if capture.failed() {
+                failed.push(serial);
+            } else if capture.streamed() {
+                self.failures.remove(&serial);
+            }
+        }
         for serial in failed {
             self.captures.remove(&serial);
-            self.retry.insert(serial, now + REOPEN_DELAY);
+            self.failed(serial, now);
         }
 
-        for &serial in self.wanted.intersection(&in_graph) {
+        let missing: Vec<u64> = self.wanted.intersection(&in_graph).copied().collect();
+        for serial in missing {
             if self.captures.contains_key(&serial)
                 || self.retry.get(&serial).is_some_and(|&at| at > now)
             {
                 continue;
             }
             self.retry.remove(&serial);
-            match open_capture(core, serial, events.clone()) {
-                Ok(capture) => {
+            match open(serial) {
+                Some(capture) => {
                     self.captures.insert(serial, capture);
                 }
-                Err(_) => {
-                    self.retry.insert(serial, now + REOPEN_DELAY);
-                }
+                None => self.failed(serial, now),
             }
         }
     }
+}
+
+/// O estado da sessão de verdade.
+type LiveState = State<Capture, ClientBinding>;
+
+/// O [`State::reconcile`] com os fluxos de verdade.
+fn reconcile(state: &mut LiveState, core: &CoreRc, events: &UnboundedSender<Event>) {
+    state.reconcile(Instant::now(), &mut |serial| {
+        open_capture(core, serial, events.clone()).ok()
+    });
 }
 
 /// A thread da sessão: conecta, avisa por `ready` e roda o laço até o
@@ -270,7 +392,7 @@ fn run(
         }
     };
 
-    let state = Rc::new(RefCell::new(State::default()));
+    let state = Rc::new(RefCell::new(LiveState::default()));
     let ready = Rc::new(RefCell::new(Some(ready)));
 
     let registry_listener = {
@@ -289,11 +411,7 @@ fn run(
             .global_remove(move |id| {
                 let (state, events) = &removed;
                 if let Some(state) = state.upgrade() {
-                    let mut state = state.borrow_mut();
-                    if state.nodes.remove(&id).is_some() {
-                        state.send_graph(events);
-                    }
-                    state.clients.remove(&id);
+                    state.borrow_mut().remove_global(id, events);
                 }
             })
             .register()
@@ -364,7 +482,7 @@ fn run(
         let (state, core, events) = (Rc::downgrade(&state), core.clone(), events.clone());
         let timer = mainloop.loop_().add_timer(move |_| {
             if let Some(state) = state.upgrade() {
-                state.borrow_mut().reconcile(&core, &events);
+                reconcile(&mut state.borrow_mut(), &core, &events);
             }
         });
         let _ = timer.update_timer(Some(TICK), Some(TICK));
@@ -383,7 +501,7 @@ fn run(
                 if let Some(state) = state.upgrade() {
                     let mut state = state.borrow_mut();
                     state.wanted = serials.into_iter().collect();
-                    state.reconcile(&core, &events);
+                    reconcile(&mut state, &core, &events);
                 }
             }
             Command::Quit => {
@@ -403,7 +521,7 @@ fn run(
     {
         let mut state = state.borrow_mut();
         state.captures.clear();
-        state.clients.clear();
+        state.bindings.clear();
     }
     drop(core_listener);
     drop(registry_listener);
@@ -416,7 +534,7 @@ fn run(
 
 /// Um objeto novo no registro: guarda os nós de saída e liga os clients.
 fn on_global(
-    state: &Rc<RefCell<State>>,
+    state: &Rc<RefCell<LiveState>>,
     registry: &RegistryRc,
     global: &GlobalObject<&DictRef>,
     events: &UnboundedSender<Event>,
@@ -459,13 +577,13 @@ fn on_global(
                     state.send_graph(&events);
                 })
                 .register();
-            state.borrow_mut().clients.insert(
+            let mut state = state.borrow_mut();
+            state.clients.insert(id, ClientInfo::default());
+            state.bindings.insert(
                 id,
-                ClientEntry {
+                ClientBinding {
                     _listener: listener,
                     _proxy: proxy,
-                    pid: None,
-                    binary: None,
                 },
             );
         }
@@ -493,15 +611,18 @@ fn open_capture(
     let stream = StreamRc::new(core.clone(), NODE_NAME, props)?;
 
     let failed = Rc::new(Cell::new(false));
-    let flag = failed.clone();
+    let streamed = Rc::new(Cell::new(false));
+    let (flag, ran) = (failed.clone(), streamed.clone());
     let listener = stream
         .add_local_listener_with_user_data(Format::default())
         .state_changed(move |_, _, _, new| {
             if let StreamState::Error(e) = &new {
                 eprintln!("lucernad: o fluxo de captura do nó {serial} caiu: {e}");
             }
-            if matches!(new, StreamState::Error(_) | StreamState::Unconnected) {
-                flag.set(true);
+            match new {
+                StreamState::Error(_) | StreamState::Unconnected => flag.set(true),
+                StreamState::Streaming => ran.set(true),
+                _ => {}
             }
         })
         .param_changed(|_, format, id, param| {
@@ -555,6 +676,7 @@ fn open_capture(
         _listener: listener,
         _stream: stream,
         failed,
+        streamed,
     })
 }
 
@@ -588,4 +710,131 @@ fn downmix(bytes: &[u8], channels: usize) -> Vec<f32> {
             sum / channels as f32
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// O dublê de um fluxo: o teste diz se ele caiu ou rodou.
+    #[derive(Clone, Default)]
+    struct FakeStream {
+        failed: Rc<Cell<bool>>,
+        streamed: Rc<Cell<bool>>,
+    }
+
+    impl Stream for FakeStream {
+        fn failed(&self) -> bool {
+            self.failed.get()
+        }
+
+        fn streamed(&self) -> bool {
+            self.streamed.get()
+        }
+    }
+
+    type FakeState = State<FakeStream, ()>;
+
+    const SERIAL: u64 = 100;
+
+    /// Um estado com o nó `SERIAL` (do client 5) no grafo e pedido.
+    fn wanting() -> FakeState {
+        let mut state = FakeState::default();
+        state.nodes.insert(
+            10,
+            NodeGlobal {
+                serial: SERIAL,
+                client: Some(5),
+            },
+        );
+        state.wanted.insert(SERIAL);
+        state
+    }
+
+    #[test]
+    fn a_client_that_leaves_resends_the_graph() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = wanting();
+        state.clients.insert(
+            5,
+            ClientInfo {
+                pid: Some(42),
+                binary: Some("spotify".into()),
+            },
+        );
+        state.bindings.insert(5, ());
+        state.send_graph(&tx);
+        let Ok(Event::Graph(nodes)) = rx.try_recv() else {
+            panic!("o primeiro Graph");
+        };
+        assert_eq!(nodes[0].client_pid, Some(42));
+
+        state.remove_global(5, &tx);
+        let Ok(Event::Graph(nodes)) = rx.try_recv() else {
+            panic!("o Graph sem o client");
+        };
+        assert_eq!((nodes[0].client_pid, nodes[0].binary.clone()), (None, None));
+        assert!(state.bindings.is_empty());
+        // Um id desconhecido não manda nada.
+        state.remove_global(77, &tx);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_refused_target_waits_longer_each_time() {
+        let mut state = wanting();
+        let opens = Cell::new(0);
+        let mut refuse = |_| {
+            opens.set(opens.get() + 1);
+            None
+        };
+        let mut now = Instant::now();
+        for (i, secs) in [0.5, 1.0, 2.0, 4.0, 8.0, 8.0, 8.0].into_iter().enumerate() {
+            state.reconcile(now, &mut refuse);
+            assert_eq!(opens.get(), i + 1);
+            let at = state.retry[&SERIAL];
+            assert_eq!(at - now, Duration::from_secs_f32(secs), "falha {}", i + 1);
+            // Antes do prazo, não tenta.
+            state.reconcile(at - Duration::from_millis(1), &mut refuse);
+            assert_eq!(opens.get(), i + 1);
+            now = at;
+        }
+    }
+
+    #[test]
+    fn a_stream_that_ran_resets_the_wait() {
+        let mut state = wanting();
+        let stream = FakeStream::default();
+        let now = Instant::now();
+        state.reconcile(now, &mut |_| Some(stream.clone()));
+        assert!(state.captures.contains_key(&SERIAL));
+
+        // Destruído antes de rodar: 0,5 s; recusado de novo: 1 s.
+        stream.failed.set(true);
+        state.reconcile(now, &mut |_| None);
+        assert_eq!(state.retry[&SERIAL] - now, REOPEN_DELAY);
+        let now = state.retry[&SERIAL];
+        state.reconcile(now, &mut |_| None);
+        assert_eq!(state.retry[&SERIAL] - now, 2 * REOPEN_DELAY);
+
+        // Um fluxo que rodou zera a conta.
+        let now = state.retry[&SERIAL];
+        let ran = FakeStream::default();
+        state.reconcile(now, &mut |_| Some(ran.clone()));
+        ran.streamed.set(true);
+        state.reconcile(now, &mut |_| None);
+        ran.failed.set(true);
+        state.reconcile(now, &mut |_| None);
+        assert_eq!(state.retry[&SERIAL] - now, REOPEN_DELAY);
+    }
+
+    #[test]
+    fn a_node_out_of_the_request_forgets_its_failures() {
+        let mut state = wanting();
+        let now = Instant::now();
+        state.reconcile(now, &mut |_| None);
+        state.wanted.clear();
+        state.reconcile(now, &mut |_| None);
+        assert!(state.retry.is_empty() && state.failures.is_empty());
+    }
 }

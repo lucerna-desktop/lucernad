@@ -71,10 +71,10 @@ fn fake_counts_sessions_and_failures() {
 
 #[test]
 fn pipewire_without_server_is_an_error() {
-    let pipewire = PipeWire {
-        remote: Some("/inexistente/lucernad-teste".into()),
-        timeout: Duration::from_secs(2),
-    };
+    let pipewire = PipeWire::new(
+        Some("/inexistente/lucernad-teste".into()),
+        Duration::from_secs(2),
+    );
 
     let start = Instant::now();
     let err = pipewire.probe().expect_err("sem servidor, a sonda falha");
