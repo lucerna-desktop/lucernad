@@ -184,6 +184,59 @@ fn manual_on_ignores_auto_exit() {
 }
 
 #[test]
+fn manual_off_latch_survives_a_lost_hyprland() {
+    let s = settings();
+    let t0 = Instant::now();
+    let game = || trig(&[win("0x1", 10, "dota2", 0, 1)], &[1], &[10], &s);
+    let mut m = Machine::new();
+    m.update(game(), t0);
+    m.set_manual(false, t0 + ms(100));
+    // O socket some: sem gatilhos, mas sem ver as janelas a trava fica.
+    m.lost(t0 + ms(200));
+    m.tick(t0 + ms(10_000));
+    assert!(!m.view().active);
+    assert!(m.view().windows.is_empty());
+    assert_eq!(m.view().manual, Some(false));
+    // O Hyprland volta com o jogo aberto: continua desligado.
+    m.update(game(), t0 + ms(11_000));
+    assert!(!m.view().active);
+    assert_eq!(m.view().manual, Some(false));
+    // Uma leitura de verdade sem o jogo solta a trava, depois da espera.
+    m.lost(t0 + ms(12_000));
+    m.update(vec![], t0 + ms(13_000));
+    m.tick(t0 + ms(16_100));
+    assert_eq!(m.view().manual, None);
+}
+
+#[test]
+fn manual_off_latch_survives_a_second_lost_after_the_wait() {
+    let s = settings();
+    let t0 = Instant::now();
+    let mut m = Machine::new();
+    m.update(trig(&[win("0x1", 10, "dota2", 0, 1)], &[1], &[10], &s), t0);
+    m.set_manual(false, t0 + ms(100));
+    m.lost(t0 + ms(200));
+    m.tick(t0 + ms(200) + AUTO_EXIT + ms(100));
+    // Outro evento com o socket ainda fora do ar, já depois da espera.
+    m.lost(t0 + ms(200) + AUTO_EXIT + ms(200));
+    assert_eq!(m.view().manual, Some(false));
+    assert!(!m.view().active);
+}
+
+#[test]
+fn lost_hyprland_leaves_the_automatic_mode() {
+    let s = settings();
+    let t0 = Instant::now();
+    let mut m = Machine::new();
+    m.update(trig(&[win("0x1", 10, "dota2", 0, 1)], &[1], &[10], &s), t0);
+    assert!(m.view().active);
+    m.lost(t0 + ms(100));
+    m.tick(t0 + ms(100) + AUTO_EXIT);
+    assert!(!m.view().active);
+    assert_eq!(m.view().manual, None);
+}
+
+#[test]
 fn manual_off_latches_until_triggers_go() {
     let s = settings();
     let t0 = Instant::now();

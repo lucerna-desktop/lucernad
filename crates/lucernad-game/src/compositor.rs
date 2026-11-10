@@ -3,6 +3,7 @@
 //! diário gravado antes de qualquer mudança e a restauração exata, opção por
 //! opção.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use lucernad_hyprland::options::OptionValue;
@@ -23,6 +24,30 @@ pub const OPTIONS: [&str; 5] = [BLUR, SHADOW, ANIMATIONS, VRR, TEARING];
 
 /// A propriedade de janela do tearing.
 const IMMEDIATE: &str = "immediate";
+
+/// O que o modo jogo lembra entre as reaplicações de um mesmo modo ativo
+/// (vazio a cada entrada): os valores que viu depois da última mudança e as
+/// opções devolvidas ao usuário, que ele mudou no meio do jogo e que um
+/// `configure` ou uma troca das janelas do tearing não replaneja até o modo
+/// sair. Um reload devolve tudo ao arquivo e o modo jogo reaplica tudo (D5);
+/// um Hyprland reiniciado (outra instância) começa a sessão do zero. A opção
+/// devolvida sai do diário de vez: se o usuário a puser de novo no valor que
+/// o modo jogo tinha posto, ela fica assim ao sair (sem reaplicação no meio,
+/// o diário antigo a devolveria ao antes).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Session {
+    /// A instância do Hyprland em que o `seen` foi visto.
+    instance: Option<String>,
+    seen: Vec<(String, OptionValue)>,
+    released: BTreeSet<String>,
+}
+
+impl Session {
+    /// As opções devolvidas ao usuário.
+    pub fn released(&self) -> &BTreeSet<String> {
+        &self.released
+    }
+}
 
 /// O que mudar, a partir dos valores `current` (os de antes): os efeitos em
 /// falso; o VRR em 2 só se estiver em 0 (D6); o tearing só se pedido (D7).
@@ -51,30 +76,33 @@ pub fn plan(current: &[(String, OptionValue)], s: &GameSettings) -> Vec<Entry> {
 /// lê as opções, monta o "antes" (o do diário para a opção que ainda está
 /// com o valor posto; o atual para as outras), **grava o diário**, muda
 /// tudo num `eval` só, desfaz o que deixou de ser pedido e acerta o
-/// `immediate` das `tearing_windows`. Devolve o diário (`None` sem nada a
-/// desfazer, e então sem arquivo).
+/// `immediate` das `tearing_windows`. A opção que o usuário mudou desde a
+/// última vez (pela `session`) fica com ele: sai do diário e do plano.
+/// Devolve o diário (`None` sem nada a desfazer, e então sem arquivo).
 pub async fn apply(
     hypr: &dyn Hypr,
     store: &Store,
     s: &GameSettings,
     tearing_windows: &[String],
+    session: &mut Session,
 ) -> Result<Option<Journal>, HyprError> {
-    reconcile(hypr, store, s, tearing_windows).await
+    reconcile(hypr, store, s, tearing_windows, session, false).await
 }
 
 /// O [`apply`] depois de um `configreloaded`: o reload pôs tudo de volta ao
 /// arquivo, então a opção com outro valor ganha o novo "antes"; a que voltou
 /// no mesmo valor que o modo jogo pôs fica com o "antes" do diário (D5,
 /// decisão do usuário: do lado seguro, mesmo com a corrida entre o reload e o
-/// evento). Hoje é o mesmo cálculo do [`apply`]; fica separado como a porta
-/// do reload.
+/// evento). Ao contrário do [`apply`], nada fica com o usuário: as opções
+/// devolvidas voltam ao plano.
 pub async fn apply_after_reload(
     hypr: &dyn Hypr,
     store: &Store,
     s: &GameSettings,
     tearing_windows: &[String],
+    session: &mut Session,
 ) -> Result<Option<Journal>, HyprError> {
-    reconcile(hypr, store, s, tearing_windows).await
+    reconcile(hypr, store, s, tearing_windows, session, true).await
 }
 
 fn save(store: &Store, j: &Journal) -> Result<(), HyprError> {
@@ -88,6 +116,8 @@ async fn reconcile(
     store: &Store,
     s: &GameSettings,
     tearing_windows: &[String],
+    session: &mut Session,
+    reload: bool,
 ) -> Result<Option<Journal>, HyprError> {
     let mut now = Vec::new();
     for o in OPTIONS {
@@ -97,11 +127,37 @@ async fn reconcile(
         .instance()
         .ok_or_else(|| HyprError::Unreachable("sem instância do Hyprland".into()))?;
     let prev = store.load().filter(|j| j.instance == instance);
+    if session.instance.as_deref() != Some(instance.as_str()) {
+        // Outra instância: os valores dela são os do arquivo, não do usuário.
+        *session = Session {
+            instance: Some(instance.clone()),
+            ..Session::default()
+        };
+    }
+    if reload {
+        session.released.clear();
+    } else {
+        // O que mudou desde o que o modo jogo viu foi o usuário: fica com ele.
+        for (o, cur) in &now {
+            if session.seen.iter().any(|(so, sv)| so == o && sv != cur) {
+                session.released.insert(o.clone());
+            }
+        }
+    }
+    // Até o eval dar certo, nada de comparar com o que se viu.
+    session.seen.clear();
+    let released = &session.released;
     // O "antes" do diário vale para a opção que está com o valor posto,
     // inclusive depois de um reload (D5, decisão do usuário): um reload que
     // devolve o mesmo valor, ou um reconcile que já reaplicou antes do
     // `configreloaded`, nunca apaga o valor de antes.
-    let prev_entries: &[Entry] = prev.as_ref().map_or(&[], |j| &j.entries[..]);
+    let prev_entries: Vec<Entry> = prev
+        .as_ref()
+        .map_or(&[][..], |j| &j.entries[..])
+        .iter()
+        .filter(|e| !released.contains(&e.option))
+        .cloned()
+        .collect();
     let ours = |o: &str, cur: &OptionValue| {
         prev_entries
             .iter()
@@ -109,6 +165,7 @@ async fn reconcile(
     };
     let baseline: Vec<(String, OptionValue)> = now
         .iter()
+        .filter(|(o, _)| !released.contains(o))
         .map(|(o, cur)| {
             let before = ours(o, cur).map_or(cur, |e| &e.before);
             (o.clone(), before.clone())
@@ -171,6 +228,16 @@ async fn reconcile(
     for w in to_off {
         set_window_prop(hypr, w, IMMEDIATE, "0").await?;
     }
+    session.seen = now
+        .into_iter()
+        .map(|(o, v)| {
+            let v = changes
+                .iter()
+                .find(|(c, _)| *c == o)
+                .map_or(v, |(_, n)| n.clone());
+            (o, v)
+        })
+        .collect();
     if target.is_empty() {
         store.clear();
         Ok(None)
@@ -203,10 +270,24 @@ pub async fn restore(hypr: &dyn Hypr, store: &Store, journal: &Journal) -> Resul
     for e in journal.entries.iter().skip(1) {
         now.push((e.option.clone(), get_option(hypr, &e.option).await?));
     }
+    // A opção que não está mais com o valor posto ficou com o usuário (M3):
+    // sai do diário antes do eval, para uma nova tentativa não a devolver ao
+    // antes se ele a puser depois no mesmo valor que o modo jogo tinha posto.
+    let ours = |e: &Entry| now.iter().any(|(o, v)| *o == e.option && *v == e.applied);
+    if !journal.entries.iter().all(ours) {
+        let mut left = journal.clone();
+        left.entries.retain(ours);
+        if left.is_empty() {
+            // Nada mais a desfazer: sem diário vazio segurando o daemon.
+            store.clear();
+            return Ok(());
+        }
+        save(store, &left)?;
+    }
     let mut changes: Vec<(&str, OptionValue)> = journal
         .entries
         .iter()
-        .filter(|e| now.iter().any(|(o, v)| *o == e.option && *v == e.applied))
+        .filter(|e| ours(e))
         .map(|e| (e.option.as_str(), e.before.clone()))
         .collect();
     changes.sort_by_key(|(o, _)| OPTIONS.iter().position(|x| x == o));

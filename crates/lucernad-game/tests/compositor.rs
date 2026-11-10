@@ -4,7 +4,9 @@
 
 use std::collections::BTreeMap;
 
-use lucernad_game::compositor::{apply, apply_after_reload, plan, restore, restore_cli_at};
+use lucernad_game::compositor::{
+    Session, apply, apply_after_reload, plan, restore, restore_cli_at,
+};
 use lucernad_game::config::GameSettings;
 use lucernad_game::journal::{Entry, Store};
 use lucernad_hyprland::Hypr;
@@ -101,9 +103,15 @@ async fn journal_written_before_eval() {
     let (_d, store) = store();
     let h = FakeHypr::new();
     h.fail_on("eval", HyprError::TimedOut);
-    let e = apply(&h, &store, &GameSettings::default(), &[])
-        .await
-        .unwrap_err();
+    let e = apply(
+        &h,
+        &store,
+        &GameSettings::default(),
+        &[],
+        &mut Session::default(),
+    )
+    .await
+    .unwrap_err();
     assert_eq!(e, HyprError::TimedOut);
     let j = store.load().expect("o diário já existe antes do eval");
     assert_eq!(j.instance, "fake_1");
@@ -131,7 +139,7 @@ async fn restore_returns_exact_values() {
         tearing: true,
         ..GameSettings::default()
     };
-    let j = apply(&h, &store, &s, &["0xab".into()])
+    let j = apply(&h, &store, &s, &["0xab".into()], &mut Session::default())
         .await
         .unwrap()
         .unwrap();
@@ -157,10 +165,16 @@ async fn restore_returns_exact_values() {
 async fn user_change_during_game_is_kept() {
     let (_d, store) = store();
     let h = FakeHypr::new();
-    let j = apply(&h, &store, &GameSettings::default(), &[])
-        .await
-        .unwrap()
-        .unwrap();
+    let j = apply(
+        &h,
+        &store,
+        &GameSettings::default(),
+        &[],
+        &mut Session::default(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     // O usuário liga as animações na mão durante o jogo.
     h.set_option(ANIM, Bool(true));
     h.set_option(VRR, Int(1));
@@ -175,8 +189,9 @@ async fn user_change_during_game_is_kept() {
 async fn reload_mid_game_resnapshots_and_reapplies() {
     let (_d, store) = store();
     let h = FakeHypr::new();
+    let mut sess = Session::default();
     let s = GameSettings::default();
-    apply(&h, &store, &s, &[]).await.unwrap();
+    apply(&h, &store, &s, &[], &mut sess).await.unwrap();
     // O usuário salva o arquivo: o reload volta tudo ao arquivo, que agora
     // tem o desfoque desligado e o VRR 1.
     h.reload(&[
@@ -186,7 +201,7 @@ async fn reload_mid_game_resnapshots_and_reapplies() {
         (VRR, Int(1)),
         (TEAR, Bool(false)),
     ]);
-    let j = apply_after_reload(&h, &store, &s, &[])
+    let j = apply_after_reload(&h, &store, &s, &[], &mut sess)
         .await
         .unwrap()
         .unwrap();
@@ -210,14 +225,18 @@ async fn reapply_keeps_the_first_before() {
     // primeiro apply, e o item desligado volta na hora.
     let (_d, store) = store();
     let h = FakeHypr::new();
-    apply(&h, &store, &GameSettings::default(), &[])
+    let mut sess = Session::default();
+    apply(&h, &store, &GameSettings::default(), &[], &mut sess)
         .await
         .unwrap();
     let no_effects = GameSettings {
         effects: false,
         ..GameSettings::default()
     };
-    let j = apply(&h, &store, &no_effects, &[]).await.unwrap().unwrap();
+    let j = apply(&h, &store, &no_effects, &[], &mut sess)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(names(&j.entries), vec![VRR]);
     assert_eq!(j.entries[0].before, Int(0));
     assert_eq!(h.option(ANIM), Some(Bool(true)), "desfeito na hora");
@@ -227,7 +246,10 @@ async fn reapply_keeps_the_first_before() {
         vrr: false,
         ..GameSettings::default()
     };
-    assert_eq!(apply(&h, &store, &nothing, &[]).await.unwrap(), None);
+    assert_eq!(
+        apply(&h, &store, &nothing, &[], &mut sess).await.unwrap(),
+        None
+    );
     assert_eq!(h.options(), default_options());
     assert_eq!(store.load(), None);
 }
@@ -236,10 +258,16 @@ async fn reapply_keeps_the_first_before() {
 async fn journal_of_other_instance_is_dropped() {
     let (_d, store) = store();
     let h = FakeHypr::new();
-    let j = apply(&h, &store, &GameSettings::default(), &[])
-        .await
-        .unwrap()
-        .unwrap();
+    let j = apply(
+        &h,
+        &store,
+        &GameSettings::default(),
+        &[],
+        &mut Session::default(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     // O Hyprland reiniciou: outra instância, já com a config do arquivo.
     h.set_instance(Some("fake_2"));
     for (k, v) in default_options() {
@@ -255,10 +283,16 @@ async fn journal_of_other_instance_is_dropped() {
 async fn failed_restore_keeps_journal_and_retries() {
     let (_d, store) = store();
     let h = FakeHypr::new();
-    let j = apply(&h, &store, &GameSettings::default(), &[])
-        .await
-        .unwrap()
-        .unwrap();
+    let j = apply(
+        &h,
+        &store,
+        &GameSettings::default(),
+        &[],
+        &mut Session::default(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     h.fail_on("eval", HyprError::TimedOut);
     assert_eq!(restore(&h, &store, &j).await, Err(HyprError::TimedOut));
     assert_eq!(store.load(), Some(j.clone()));
@@ -280,10 +314,16 @@ async fn restore_cli_without_daemon() {
     assert!(fake.requests().is_empty());
     // Um modo jogo deixado no meio (o daemon morto com kill -9).
     let h = lucernad_hyprland::SocketHypr::at(&run, Some("sig_7"));
-    let j = apply(&h, &store, &GameSettings::default(), &[])
-        .await
-        .unwrap()
-        .unwrap();
+    let j = apply(
+        &h,
+        &store,
+        &GameSettings::default(),
+        &[],
+        &mut Session::default(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(j.instance, "sig_7");
     assert_eq!(h.instance().as_deref(), Some("sig_7"));
     drop(h);
@@ -309,8 +349,9 @@ async fn reload_race_keeps_the_original_before() {
     // não pode se perder, senão os efeitos ficam desligados ao sair.
     let (_d, store) = store();
     let h = FakeHypr::new();
+    let mut sess = Session::default();
     let s = GameSettings::default();
-    apply(&h, &store, &s, &[]).await.unwrap();
+    apply(&h, &store, &s, &[], &mut sess).await.unwrap();
     h.reload(
         &default_options()
             .into_iter()
@@ -319,11 +360,133 @@ async fn reload_race_keeps_the_original_before() {
             .map(|(k, v)| (k.as_str(), v.clone()))
             .collect::<Vec<_>>(),
     );
-    apply(&h, &store, &s, &[]).await.unwrap();
-    let j = apply_after_reload(&h, &store, &s, &[])
+    apply(&h, &store, &s, &[], &mut sess).await.unwrap();
+    let j = apply_after_reload(&h, &store, &s, &[], &mut sess)
         .await
         .unwrap()
         .unwrap();
+    restore(&h, &store, &j).await.unwrap();
+    assert_eq!(h.options(), default_options());
+}
+
+#[tokio::test]
+async fn user_change_mid_game_survives_a_reapply() {
+    // O usuário liga as animações no meio do jogo; um configure ou uma
+    // troca das janelas do tearing reaplica o resto e deixa a escolha dele
+    // (M2).
+    let (_d, store) = store();
+    let h = FakeHypr::new();
+    let mut sess = Session::default();
+    let s = GameSettings {
+        tearing: true,
+        ..GameSettings::default()
+    };
+    apply(&h, &store, &s, &["0xa".into()], &mut sess)
+        .await
+        .unwrap();
+    h.set_option(ANIM, Bool(true));
+    let j = apply(&h, &store, &s, &["0xa".into(), "0xb".into()], &mut sess)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(h.option(ANIM), Some(Bool(true)), "a escolha dele fica");
+    assert_eq!(h.prop("0xb", "immediate").as_deref(), Some("1"));
+    assert_eq!(names(&j.entries), vec![BLUR, SHADOW, VRR, TEAR]);
+    assert!(sess.released().contains(ANIM));
+    // Outra reaplicação (um configure) também não a replaneja.
+    let no_vrr = GameSettings { vrr: false, ..s };
+    let j = apply(&h, &store, &no_vrr, &["0xa".into()], &mut sess)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(h.option(ANIM), Some(Bool(true)));
+    assert_eq!(h.option(VRR), Some(Int(0)), "o VRR desfeito na hora");
+    restore(&h, &store, &j).await.unwrap();
+    assert_eq!(h.options(), {
+        let mut o = default_options();
+        o.insert(ANIM.into(), Bool(true));
+        o
+    });
+}
+
+#[tokio::test]
+async fn reload_takes_back_the_released_options() {
+    // Um reload volta tudo ao arquivo e o modo jogo reaplica tudo (D5),
+    // inclusive o que o usuário tinha pego no meio.
+    let (_d, store) = store();
+    let h = FakeHypr::new();
+    let mut sess = Session::default();
+    let s = GameSettings::default();
+    apply(&h, &store, &s, &[], &mut sess).await.unwrap();
+    h.set_option(ANIM, Bool(true));
+    apply(&h, &store, &s, &[], &mut sess).await.unwrap();
+    assert_eq!(h.option(ANIM), Some(Bool(true)));
+    h.reload(&[(ANIM, Bool(true))]);
+    let j = apply_after_reload(&h, &store, &s, &[], &mut sess)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(sess.released().is_empty());
+    assert_eq!(h.option(ANIM), Some(Bool(false)), "reaplicado");
+    restore(&h, &store, &j).await.unwrap();
+    assert_eq!(h.options(), default_options());
+}
+
+#[tokio::test]
+async fn pending_restore_keeps_a_later_user_choice() {
+    // A restauração falha; o usuário muda as animações no meio e depois as
+    // põe no valor que o modo jogo tinha posto: a nova tentativa não as
+    // devolve ao antes (M3).
+    let (_d, store) = store();
+    let h = FakeHypr::new();
+    apply(
+        &h,
+        &store,
+        &GameSettings::default(),
+        &[],
+        &mut Session::default(),
+    )
+    .await
+    .unwrap();
+    h.set_option(ANIM, Bool(true));
+    h.fail_on("eval", HyprError::TimedOut);
+    let j = store.load().unwrap();
+    assert_eq!(restore(&h, &store, &j).await, Err(HyprError::TimedOut));
+    let left = store.load().unwrap();
+    assert_eq!(names(&left.entries), vec![BLUR, SHADOW, VRR], "devolvida");
+    h.set_option(ANIM, Bool(false));
+    restore(&h, &store, &left).await.unwrap();
+    assert_eq!(
+        h.option(ANIM),
+        Some(Bool(false)),
+        "a escolha de depois fica"
+    );
+    assert_eq!(h.option(BLUR), Some(Bool(true)));
+    assert_eq!(h.option(VRR), Some(Int(0)));
+    assert_eq!(store.load(), None);
+}
+
+#[tokio::test]
+async fn hyprland_restart_mid_game_is_not_a_user_change() {
+    // O Hyprland reinicia com o modo ligado: a instância nova tem os valores
+    // do arquivo, que não são escolha do usuário no meio do jogo.
+    let (_d, store) = store();
+    let h = FakeHypr::new();
+    let mut sess = Session::default();
+    let s = GameSettings::default();
+    apply(&h, &store, &s, &[], &mut sess).await.unwrap();
+    h.set_instance(Some("fake_2"));
+    for (k, v) in default_options() {
+        h.set_option(&k, v);
+    }
+    let j = apply(&h, &store, &s, &[], &mut sess)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(sess.released().is_empty());
+    assert_eq!(j.instance, "fake_2");
+    assert_eq!(h.option(ANIM), Some(Bool(false)), "reaplicado");
+    assert_eq!(h.option(BLUR), Some(Bool(false)));
     restore(&h, &store, &j).await.unwrap();
     assert_eq!(h.options(), default_options());
 }

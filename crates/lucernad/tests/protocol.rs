@@ -175,7 +175,13 @@ async fn the_daemon_serves_the_game_module() {
     for t in ["game.state", "game.status"] {
         assert!(c.hello().topics.iter().any(|x| x == t), "falta {t}");
     }
-    for m in ["game.set", "game.toggle", "game.configure", "game.get"] {
+    for m in [
+        "game.set",
+        "game.toggle",
+        "game.configure",
+        "game.get",
+        "game.defaults",
+    ] {
         assert!(c.hello().methods.iter().any(|x| x == m), "falta {m}");
     }
     let s = c.call("game.get", Some(json!({}))).await.unwrap();

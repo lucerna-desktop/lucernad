@@ -1,7 +1,7 @@
 //! O `game.configure`: o padrão do Formato, os erros `-32602` e as classes
 //! guardadas em minúsculas.
 
-use lucernad_game::config::{DEFAULT_NEVER, GameSettings, parse};
+use lucernad_game::config::{DEFAULT_NEVER, GameSettings, defaults, parse};
 use serde_json::json;
 
 /// O texto do `-32602` do SDK com o detalhe `d`.
@@ -71,4 +71,22 @@ fn configure_rejects_bad_lists() {
     );
     let e = parse(&json!({"compositor": true})).unwrap_err();
     assert_eq!(e.message, invalid("compositor precisa ser um objeto"));
+}
+
+#[test]
+fn defaults_are_the_configure_format() {
+    let d = defaults();
+    // No Formato do `game.configure`: mandado de volta, dá o padrão.
+    assert_eq!(parse(&d).unwrap(), GameSettings::default());
+    assert_eq!(d["never"], json!(DEFAULT_NEVER));
+    assert_eq!(d["always"], json!([]));
+    assert_eq!(d["auto"], json!({"fullscreen": true, "games": true}));
+    assert_eq!(
+        d["compositor"],
+        json!({"effects": true, "vrr": true, "tearing": false})
+    );
+    assert_eq!(
+        d["system"],
+        json!({"profile": true, "gamemode": true, "light": true})
+    );
 }
