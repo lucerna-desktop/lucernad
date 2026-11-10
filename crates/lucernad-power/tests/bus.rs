@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use lucernad_power::bus::{
     BacklightWriter, MAX_POINTS, NoBus, Point, PowerBus, Profiles, ROOT_FORBIDDEN, TreeWriter,
-    clip_error, open_without_links, points_from, profiles_from,
+    clip_error, next_read_retry, open_without_links, points_from, profiles_from,
 };
 use lucernad_power::roots::Roots;
 use lucernad_power::testing::{Tree, isolated};
@@ -302,4 +302,24 @@ fn tree_bus_follows_the_fake_profiles() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(rx.try_recv().is_err(), "nada muda");
     });
+}
+
+/// A nova tentativa dos perfis dobra a cada falha seguida, até o teto.
+#[test]
+fn profile_read_retry_doubles_up_to_the_cap() {
+    use lucernad_power::bus::{PROFILES_READ_RETRY, PROFILES_RETRY};
+    use std::time::Duration;
+    let mut wait = PROFILES_READ_RETRY;
+    let mut seen = vec![wait];
+    for _ in 0..5 {
+        wait = next_read_retry(wait, PROFILES_RETRY);
+        seen.push(wait);
+    }
+    let secs: Vec<u64> = seen.iter().map(Duration::as_secs).collect();
+    assert_eq!(secs, [2, 4, 8, 16, 30, 30]);
+    // Um teto menor que o começo não encurta a espera.
+    assert_eq!(
+        next_read_retry(PROFILES_READ_RETRY, Duration::from_millis(1)),
+        PROFILES_READ_RETRY
+    );
 }

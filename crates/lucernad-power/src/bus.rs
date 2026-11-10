@@ -45,7 +45,8 @@ pub const DBUS_TIMEOUT: Duration = Duration::from_secs(2);
 pub const PROFILES_RETRY: Duration = Duration::from_secs(30);
 
 /// Depois de uma leitura incerta dos perfis (um erro ou um prazo estourado
-/// no meio), em quanto tempo ela é refeita.
+/// no meio), em quanto tempo ela é refeita (a primeira vez; a espera dobra a
+/// cada falha seguida, até o [`PROFILES_RETRY`]).
 pub const PROFILES_READ_RETRY: Duration = Duration::from_secs(2);
 
 /// O máximo de pontos do histórico publicados (os mais novos).
@@ -186,8 +187,8 @@ pub trait PowerBus: Send + Sync + 'static {
 
     /// Os perfis: manda o estado atual e cada mudança (o serviço subir, cair
     /// ou mudar a lista). Sem D-Bus, tenta de novo a cada
-    /// [`PROFILES_RETRY`]; uma leitura que falha, a cada
-    /// [`PROFILES_READ_RETRY`]. Largar o receptor encerra a tarefa. Precisa de um
+    /// [`PROFILES_RETRY`]; uma leitura que falha, em
+    /// [`PROFILES_READ_RETRY`], dobrando até o [`PROFILES_RETRY`]. Largar o receptor encerra a tarefa. Precisa de um
     /// runtime do `tokio`.
     fn watch_profiles(&self) -> UnboundedReceiver<Profiles>;
 }
@@ -441,7 +442,7 @@ async fn follow_profiles(power: ZbusPower, tx: UnboundedSender<Profiles>) {
     loop {
         match power.bus.connection().await {
             Ok(conn) => {
-                if let Ended::Closed = follow_on(&conn, &tx, &mut last).await {
+                if let Ended::Closed = follow_on(&conn, &tx, &mut last, power.retry).await {
                     return;
                 }
                 power.bus.forget().await;
@@ -471,6 +472,7 @@ async fn follow_on(
     conn: &Connection,
     tx: &UnboundedSender<Profiles>,
     last: &mut Option<Profiles>,
+    retry: Duration,
 ) -> Ended {
     let mut streams = Vec::new();
     for (name, path) in PROFILE_SERVICES {
@@ -493,9 +495,11 @@ async fn follow_on(
     }
     // Os sinais assinados antes da leitura: nenhuma mudança fica no meio.
     // Uma leitura incerta (`None`) não publica (fica o último estado) e é
-    // refeita em [`PROFILES_READ_RETRY`], sem esperar um sinal: sem isso, uma
-    // primeira leitura que falha deixaria os perfis sem estado até o serviço
-    // mudar.
+    // refeita sem esperar um sinal (sem isso, uma primeira leitura que falha
+    // deixaria os perfis sem estado até o serviço mudar): em
+    // [`PROFILES_READ_RETRY`], dobrando a cada falha até o `retry`; uma
+    // leitura certa volta ao começo.
+    let mut wait = PROFILES_READ_RETRY;
     let mut certain = read_profiles(conn, tx, last).await;
     loop {
         tokio::select! {
@@ -506,11 +510,20 @@ async fn follow_on(
                 }
                 certain = read_profiles(conn, tx, last).await;
             }
-            () = tokio::time::sleep(PROFILES_READ_RETRY), if !certain => {
+            () = tokio::time::sleep(wait), if !certain => {
                 certain = read_profiles(conn, tx, last).await;
+                wait = next_read_retry(wait, retry);
             }
         }
+        if certain {
+            wait = PROFILES_READ_RETRY;
+        }
     }
+}
+
+/// A próxima espera depois de uma leitura incerta: o dobro, até `max`.
+pub fn next_read_retry(wait: Duration, max: Duration) -> Duration {
+    (wait * 2).min(max.max(PROFILES_READ_RETRY))
 }
 
 /// Lê os perfis e publica se a leitura foi certa; diz se foi.
