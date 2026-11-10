@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::future::{Future, poll_fn};
 use std::io::{self, Write};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -696,7 +697,9 @@ impl BacklightWriter for LogindWriter {
 /// A escrita na árvore falsa do `LUCERNAD_POWER_ROOT`: grava o `brightness`
 /// e o `actual_brightness` do backlight, nunca o logind. Cada arquivo passa
 /// pelo `canonicalize` e o que não fica sob a raiz canônica é recusado
-/// ([`OUTSIDE_ROOT`]): um link para o `/sys` de verdade nunca é escrito.
+/// ([`OUTSIDE_ROOT`]): um link para o `/sys` de verdade nunca é escrito. O
+/// caminho canônico é aberto pelo [`open_without_links`]: um link posto em
+/// qualquer componente depois do `canonicalize` também é recusado.
 pub struct TreeWriter {
     pub roots: Roots,
 }
@@ -717,10 +720,9 @@ impl TreeWriter {
         };
         let text = format!("{value}\n");
         for path in std::iter::once(brightness).chain(actual) {
-            // O `O_NOFOLLOW`: um link posto no lugar do arquivo depois do
-            // `canonicalize` é recusado (`ELOOP`), não seguido.
-            let flags = OFlags::WRONLY | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-            let fd = match rustix::fs::open(&path, flags, Mode::empty()) {
+            // Um link posto em qualquer componente depois do `canonicalize`
+            // é recusado (`ELOOP`), não seguido.
+            let fd = match open_without_links(&path, OFlags::WRONLY | OFlags::TRUNC) {
                 Ok(fd) => fd,
                 Err(Errno::LOOP) => return Err(OUTSIDE_ROOT.to_string()),
                 Err(e) => return Err(io_text(&e.into())),
@@ -741,6 +743,47 @@ impl BacklightWriter for TreeWriter {
     fn target(&self) -> &'static str {
         "na árvore de teste"
     }
+}
+
+/// Abre o caminho absoluto `path` com `flags` sem seguir link nenhum: do
+/// `/`, um `openat` por componente, com `O_NOFOLLOW` (e `O_DIRECTORY` nos
+/// diretórios do meio). Um link em qualquer componente dá `ELOOP`; um
+/// caminho relativo, ou com `.` ou `..`, dá `EINVAL` (o caminho é o já
+/// canônico). O `O_CLOEXEC` vai sempre.
+pub fn open_without_links(path: &Path, flags: OFlags) -> Result<OwnedFd, Errno> {
+    use std::path::Component;
+    let mut parts = path.components();
+    if parts.next() != Some(Component::RootDir) {
+        return Err(Errno::INVAL);
+    }
+    let names: Vec<_> = parts
+        .map(|part| match part {
+            Component::Normal(name) => Ok(name),
+            _ => Err(Errno::INVAL),
+        })
+        .collect::<Result<_, _>>()?;
+    let Some((last, dirs)) = names.split_last() else {
+        return Err(Errno::INVAL);
+    };
+    let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut dir = rustix::fs::open("/", dir_flags, Mode::empty())?;
+    for name in dirs {
+        dir = match rustix::fs::openat(&dir, *name, dir_flags, Mode::empty()) {
+            // Um link no lugar de um diretório: o `O_DIRECTORY` com o
+            // `O_NOFOLLOW` pode dar `ENOTDIR`; é o mesmo link recusado.
+            Err(Errno::NOTDIR) if is_link(&dir, name) => return Err(Errno::LOOP),
+            other => other?,
+        };
+    }
+    let flags = flags | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    rustix::fs::openat(&dir, *last, flags, Mode::empty())
+}
+
+/// Se `name` em `dir` é um link (sem segui-lo).
+fn is_link(dir: &OwnedFd, name: &std::ffi::OsStr) -> bool {
+    rustix::fs::statat(dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|st| {
+        rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Symlink
+    })
 }
 
 /// O caminho canônico de `path`, se ficar sob `root` (por componente).

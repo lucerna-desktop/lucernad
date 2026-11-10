@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use lucernad_power::bus::{
     BacklightWriter, MAX_POINTS, NoBus, Point, PowerBus, Profiles, ROOT_FORBIDDEN, TreeWriter,
-    clip_error, points_from, profiles_from,
+    clip_error, open_without_links, points_from, profiles_from,
 };
 use lucernad_power::roots::Roots;
 use lucernad_power::testing::{Tree, isolated};
@@ -168,6 +168,47 @@ fn tree_writer_refuses_links_out_of_the_root() {
         .block_on(writer.write("../../../../outside", 1))
         .expect_err("o nome sobe na árvore");
     assert!(!err.is_empty());
+}
+
+/// O `O_NOFOLLOW` em cada componente: um link no meio do caminho (posto
+/// depois do `canonicalize` do [`TreeWriter`]) é recusado, não seguido.
+#[test]
+fn opening_refuses_links_anywhere_in_the_path() {
+    use rustix::fs::OFlags;
+    let dir = TempDir::new().unwrap();
+    let base = dir.path().canonicalize().unwrap();
+    let real = base.join("real");
+    std::fs::create_dir_all(real.join("sub")).unwrap();
+    std::fs::write(real.join("sub/brightness"), "1\n").unwrap();
+    std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
+    std::os::unix::fs::symlink(real.join("sub/brightness"), real.join("sub/last")).unwrap();
+    let flags = OFlags::WRONLY | OFlags::TRUNC;
+
+    // Sem link nenhum, abre e grava.
+    let fd = open_without_links(&real.join("sub/brightness"), flags).unwrap();
+    std::io::Write::write_all(&mut std::fs::File::from(fd), b"2\n").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(real.join("sub/brightness")).unwrap(),
+        "2\n"
+    );
+
+    // O link no meio (um diretório) e no fim: os dois recusados.
+    for path in [base.join("link/sub/brightness"), real.join("sub/last")] {
+        let err = open_without_links(&path, flags).expect_err("o link é recusado");
+        assert_eq!(err, rustix::io::Errno::LOOP, "{}", path.display());
+    }
+    assert_eq!(
+        std::fs::read_to_string(real.join("sub/brightness")).unwrap(),
+        "2\n",
+        "nada gravado pelos links"
+    );
+
+    // Um caminho relativo (ou com `..`) não é aceito: só o canônico.
+    let err = open_without_links(std::path::Path::new("real/sub/brightness"), flags)
+        .expect_err("relativo");
+    assert_eq!(err, rustix::io::Errno::INVAL);
+    let err = open_without_links(&real.join("sub/../sub/brightness"), flags).expect_err("..");
+    assert_eq!(err, rustix::io::Errno::INVAL);
 }
 
 #[test]
