@@ -275,3 +275,60 @@ async fn no_idle_connection_is_kept() {
     assert_eq!(accepted.load(Ordering::SeqCst), 2, "uma conexão por pedido");
     assert_eq!(closed.load(Ordering::SeqCst), 2, "nenhuma ficou aberta");
 }
+
+/// Sem `Content-Length` (o corpo em pedaços, `Transfer-Encoding: chunked`):
+/// o limite vale pela soma dos pedaços lidos.
+#[tokio::test]
+async fn chunked_body_is_read_and_limited() {
+    let server = LocalServer::start(|seen| {
+        let size = if seen.path == "/grande" {
+            BODY_MAX + 1
+        } else {
+            BODY_MAX
+        };
+        Reply::bytes(200, vec![b'a'; size]).chunked(64 * 1024)
+    })
+    .await;
+    let http = client();
+    let big = http
+        .get(&Request::new(format!("{}/grande", server.base())))
+        .await;
+    assert_eq!(big, Err(HttpError::TooLarge));
+    let ok = http
+        .get(&Request::new(format!("{}/certo", server.base())))
+        .await
+        .expect("no limite");
+    assert_eq!(ok.body.len(), BODY_MAX);
+}
+
+/// O `LocalServer` solto fecha também as conexões que estavam abertas.
+#[tokio::test]
+async fn dropped_server_closes_open_connections() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let server =
+        LocalServer::start(|_| Reply::text(200, "tarde").after(Duration::from_secs(30))).await;
+    let addr = server.base().trim_start_matches("http://").to_string();
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(b"GET /x HTTP/1.1\r\nHost: a\r\n\r\n")
+        .await
+        .unwrap();
+    // O pedido chegou e a resposta espera.
+    let start = Instant::now();
+    while server.seen().is_empty() {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "o pedido não chegou"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    drop(server);
+    let mut buf = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut buf)).await;
+    assert!(
+        read.is_ok(),
+        "a conexão ficou aberta depois de soltar o servidor"
+    );
+    assert!(buf.is_empty(), "respondeu depois de solto: {buf:?}");
+}
