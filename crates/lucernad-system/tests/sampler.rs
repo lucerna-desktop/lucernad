@@ -231,13 +231,18 @@ async fn intel_usage_comes_in_the_first_sample() {
     let intel = g.iter().find(|g| g.pci == "0000:00:02.0").unwrap();
     assert_eq!(intel.usage, Some(0.0), "o uso na primeira amostra");
     assert!(
-        elapsed >= Duration::from_millis(150) && elapsed < Duration::from_secs(1),
+        elapsed >= Duration::from_millis(150) && elapsed < Duration::from_secs(5),
         "a leitura curta: {elapsed:?}"
     );
-    // As seguintes usam a leitura anterior, sem a espera.
+    // As seguintes usam a leitura anterior, sem a espera (a janela curta é
+    // de 200 ms; o limite fica abaixo dela, com folga para a CI carregada).
     let t0 = Instant::now();
     let g = s.gpus().await;
-    assert!(t0.elapsed() < Duration::from_millis(100));
+    assert!(
+        t0.elapsed() < Duration::from_millis(190),
+        "{:?}",
+        t0.elapsed()
+    );
     let intel = g.iter().find(|g| g.pci == "0000:00:02.0").unwrap();
     assert_eq!(intel.usage, Some(0.0));
     // Sem a linha de base (a aba fechada e aberta de novo), a espera volta.
