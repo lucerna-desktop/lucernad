@@ -41,8 +41,8 @@ impl Endpoints {
 
 /// Lê o `LUCERNAD_WEB_BASE`: ausente ou vazio → `Ok(None)`;
 /// `http://127.0.0.1:<porta>` ou `http://[::1]:<porta>` (porta de 1 a 65535,
-/// sem zero à esquerda, sem caminho nem usuário) → `Ok(Some(base))`; qualquer outra coisa → o
-/// erro, nunca a rede de verdade.
+/// sem zero à esquerda, sem caminho nem usuário) → `Ok(Some(base))`;
+/// qualquer outra coisa → o erro, nunca a rede de verdade.
 pub fn base_from_env(value: Option<&OsStr>) -> Result<Option<String>, String> {
     let Some(value) = value else {
         return Ok(None);

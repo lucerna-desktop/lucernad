@@ -7,6 +7,8 @@
 
 use serde_json::{Value, json};
 
+use crate::text::is_bidi_format;
+
 /// Máximo de linhas de uma letra.
 pub const LINES_MAX: usize = 1000;
 /// Máximo de caracteres de uma linha.
@@ -128,16 +130,6 @@ fn parse_offset(tag: &str) -> Option<f64> {
     let value = value.trim();
     let value = value.strip_prefix('+').unwrap_or(value);
     value.parse::<i64>().ok().map(|v| v as f64)
-}
-
-/// Os formatadores bidi (Cf): as marcas (`LRM`, `RLM`, `ALM`), os
-/// encaixes (`LRE`…`PDF`) e os isolamentos (`LRI`…`PDI`). Os outros Cf, como
-/// o ZWJ dos emojis, ficam.
-pub(crate) fn is_bidi_format(c: char) -> bool {
-    matches!(
-        c,
-        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-    )
 }
 
 /// Tira os caracteres de controle, os formatadores bidi e as pontas, e corta

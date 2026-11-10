@@ -45,6 +45,7 @@ pub mod lyrics;
 pub mod matching;
 pub mod net;
 mod run;
+mod text;
 pub mod weather;
 
 #[cfg(feature = "testing")]

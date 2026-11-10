@@ -3,8 +3,9 @@
 //! O [`NmConnectivity`] lê a propriedade `Connectivity` de
 //! `org.freedesktop.NetworkManager` e relê a cada `PropertiesChanged` da
 //! interface dele (no caminho dele) e a cada `NameOwnerChanged` do nome (o
-//! NetworkManager saiu ou voltou). Sem barramento ou sem o nome, o estado é [`Link::Unknown`] (o
-//! módulo tenta a rede), e a conexão é tentada de novo a cada [`RETRY`].
+//! NetworkManager saiu ou voltou). Sem barramento ou sem o nome, o estado é
+//! [`Link::Unknown`] (o módulo tenta a rede), e a conexão é tentada de novo a
+//! cada [`RETRY`].
 
 use std::future::{Future, poll_fn};
 use std::pin::Pin;

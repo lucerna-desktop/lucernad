@@ -79,11 +79,14 @@ impl Cache {
         let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
         let mut file = match rustix::fs::open(&path, flags, Mode::empty()) {
             Ok(fd) => File::from(fd),
-            Err(rustix::io::Errno::NOENT) => return None,
-            Err(_) => {
+            // Um link (`ELOOP`) ou um socket (`ENXIO`) no lugar da entrada sai.
+            Err(rustix::io::Errno::LOOP | rustix::io::Errno::NXIO) => {
                 let _ = fs::remove_file(&path);
                 return None;
             }
+            // Os outros erros (falta de descritor, de memória, de permissão)
+            // não dizem nada da entrada: ela fica.
+            Err(_) => return None,
         };
         let regular = file.metadata().is_ok_and(|md| md.is_file());
         let mut bytes = Vec::new();

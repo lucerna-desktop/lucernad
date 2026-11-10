@@ -3,7 +3,7 @@
 
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
-use crate::lrc::is_bidi_format;
+use crate::text::is_bidi_format;
 
 /// Diferença máxima de duração (em segundos) entre o pedido e a fonte.
 pub const DURATION_TOLERANCE: f64 = 2.0;

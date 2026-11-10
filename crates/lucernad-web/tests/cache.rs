@@ -226,3 +226,21 @@ fn reading_never_follows_a_link_nor_blocks_on_a_fifo() {
     assert_eq!(get_within(&cache, Kind::Lyrics, "k"), None);
     assert!(path.symlink_metadata().is_err(), "o FIFO ficou");
 }
+
+#[test]
+fn unreadable_entry_is_kept() {
+    let tmp = TempDir::new().unwrap();
+    let cache = Cache::new(tmp.path().join("web"), 1 << 20);
+    cache.put(Kind::Lyrics, "k", &json!(1), t(100)).unwrap();
+    let path = cache.path(Kind::Lyrics, "k");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    // Como root a permissão não barra a leitura: não há o que conferir.
+    if File::open(&path).is_ok() {
+        return;
+    }
+    // Um erro que não diz nada da entrada (aqui o `EACCES`) não a apaga.
+    assert_eq!(cache.get(Kind::Lyrics, "k"), None);
+    assert!(path.exists(), "a entrada boa foi apagada");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(cache.get(Kind::Lyrics, "k").is_some());
+}
