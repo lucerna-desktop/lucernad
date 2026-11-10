@@ -79,6 +79,8 @@ const GRAPHICAL: [&str; 2] = ["wayland", "x11"];
 
 const LOGIND: &str = "org.freedesktop.login1";
 const LOGIND_USER: &str = "/org/freedesktop/login1/user/self";
+const SESSION: &str = "org.freedesktop.login1.Session";
+const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 const UPOWER: &str = "org.freedesktop.UPower";
 const UPOWER_PATH: &str = "/org/freedesktop/UPower";
 const UPOWER_DEVICE: &str = "org.freedesktop.UPower.Device";
@@ -569,6 +571,39 @@ async fn current_profiles(conn: &Connection) -> Option<Profiles> {
     (!uncertain).then_some(NO_PROFILES)
 }
 
+/// O que a escrita confere na sessão do logind.
+struct Session {
+    active: bool,
+    kind: String,
+    /// O id do assento; vazio sem assento.
+    seat: String,
+}
+
+/// O `Active`, o `Type` e o `Seat` do `GetAll` da sessão; faltar um (ou vir
+/// com outro tipo) é erro, como seria a leitura de cada um.
+fn session_from(all: &HashMap<String, OwnedValue>) -> Result<Session, Failure> {
+    let missing = |name: &str| {
+        Failure::Bus(zbus::Error::Failure(format!(
+            "o logind não mandou o {name} da sessão"
+        )))
+    };
+    let active = all
+        .get("Active")
+        .and_then(|v| v.downcast_ref::<bool>().ok())
+        .ok_or_else(|| missing("Active"))?;
+    let kind = all
+        .get("Type")
+        .and_then(|v| v.downcast_ref::<&str>().ok())
+        .ok_or_else(|| missing("Type"))?
+        .to_string();
+    let (seat, _) = all
+        .get("Seat")
+        .and_then(|v| v.try_clone().ok())
+        .and_then(|v| <(String, OwnedObjectPath)>::try_from(v).ok())
+        .ok_or_else(|| missing("Seat"))?;
+    Ok(Session { active, kind, seat })
+}
+
 /// Por que não há o caminho da sessão.
 enum NoPath {
     /// O `Display` é `/`: sem sessão gráfica.
@@ -582,7 +617,8 @@ enum NoPath {
 /// A escrita pelo logind: `SetBrightness("backlight", <dispositivo>,
 /// <valor>)` na sessão do `Display` de `/org/freedesktop/login1/user/self`
 /// (a sessão gráfica do usuário). O caminho da sessão fica guardado e é
-/// relido depois de um erro.
+/// relido depois de um erro: cada escrita faz duas chamadas (o `GetAll` da
+/// sessão e o `SetBrightness`).
 pub struct LogindWriter {
     bus: SystemBus,
     session: Mutex<Option<OwnedObjectPath>>,
@@ -616,23 +652,21 @@ impl LogindWriter {
     }
 
     /// Se a sessão `path` pode receber o brilho agora: ativa e gráfica (o
-    /// `Type` `wayland` ou `x11`, ou com assento). Conferido a cada escrita:
-    /// com a troca rápida de usuário, a sessão fica inativa e o brilho é do
-    /// outro usuário.
-    async fn usable(session: &Proxy<'_>) -> Result<(), NoPath> {
-        let active: bool = within(session.get_property("Active"))
-            .await
-            .map_err(NoPath::Failed)?;
-        let kind: String = within(session.get_property("Type"))
-            .await
-            .map_err(NoPath::Failed)?;
-        let (seat, _): (String, OwnedObjectPath) = within(session.get_property("Seat"))
-            .await
-            .map_err(NoPath::Failed)?;
-        if !GRAPHICAL.contains(&kind.as_str()) && seat.is_empty() {
+    /// `Type` `wayland` ou `x11`, ou com assento). Conferido a cada escrita
+    /// (com a troca rápida de usuário, a sessão fica inativa e o brilho é do
+    /// outro usuário), num `GetAll` só: o `Active`, o `Type` e o `Seat` vêm
+    /// juntos.
+    async fn usable(conn: &Connection, path: &OwnedObjectPath) -> Result<(), NoPath> {
+        let read = async {
+            let props = proxy(conn, LOGIND, path.as_str(), PROPERTIES).await?;
+            within(props.call::<_, _, HashMap<String, OwnedValue>>("GetAll", &(SESSION,))).await
+        };
+        let all = read.await.map_err(NoPath::Failed)?;
+        let session = session_from(&all).map_err(NoPath::Failed)?;
+        if !GRAPHICAL.contains(&session.kind.as_str()) && session.seat.is_empty() {
             return Err(NoPath::NoSession);
         }
-        if !active {
+        if !session.active {
             return Err(NoPath::Inactive);
         }
         Ok(())
@@ -664,15 +698,10 @@ impl LogindWriter {
         value: u32,
     ) -> Result<(), NoPath> {
         let call = async {
-            let session = proxy(
-                conn,
-                LOGIND,
-                path.as_str(),
-                "org.freedesktop.login1.Session",
-            )
-            .await
-            .map_err(NoPath::Failed)?;
-            Self::usable(&session).await?;
+            Self::usable(conn, path).await?;
+            let session = proxy(conn, LOGIND, path.as_str(), SESSION)
+                .await
+                .map_err(NoPath::Failed)?;
             within(session.call::<_, _, ()>("SetBrightness", &("backlight", device, value)))
                 .await
                 .map_err(NoPath::Failed)

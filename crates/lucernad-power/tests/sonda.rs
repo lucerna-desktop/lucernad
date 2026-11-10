@@ -127,12 +127,28 @@ async fn logind_receives_set_brightness() {
         .await
         .unwrap();
 
+    let seen = monitor("org.freedesktop.login1").await;
     let writer = LogindWriter::system();
     writer.write("intel_backlight", 9600).await.unwrap();
     assert_eq!(
         *calls.lock().unwrap(),
         vec![("backlight".to_string(), "intel_backlight".to_string(), 9600)]
     );
+    // A primeira escrita lê o Display; as outras, só o GetAll da sessão (o
+    // Active, o Type e o Seat juntos) e o SetBrightness.
+    settle().await;
+    assert_eq!(
+        std::mem::take(&mut *seen.lock().unwrap()),
+        ["Get", "GetAll", "SetBrightness"]
+    );
+    writer.write("intel_backlight", 9500).await.unwrap();
+    settle().await;
+    assert_eq!(
+        std::mem::take(&mut *seen.lock().unwrap()),
+        ["GetAll", "SetBrightness"],
+        "duas chamadas por escrita"
+    );
+    calls.lock().unwrap().pop();
 
     // A troca rápida de usuário: a sessão fica inativa e nada é gravado (o
     // brilho na tela é o do outro usuário). Ativa de novo, volta a gravar.
@@ -180,6 +196,46 @@ async fn logind_receives_set_brightness() {
         .unwrap_err();
     assert_eq!(err, NO_SESSION);
     assert_eq!(calls.lock().unwrap().len(), 3, "nenhuma escrita a mais");
+}
+
+/// Os métodos chamados em `destination`, na ordem, vistos por uma conexão
+/// monitora (o `BecomeMonitor` do dbus-daemon de mentira).
+async fn monitor(destination: &str) -> Arc<Mutex<Vec<String>>> {
+    use std::pin::Pin;
+    use zbus::export::futures_core::Stream;
+    let conn = zbus::Connection::system().await.unwrap();
+    let rule = format!("type='method_call',destination='{destination}'");
+    conn.call_method(
+        Some("org.freedesktop.DBus"),
+        "/org/freedesktop/DBus",
+        Some("org.freedesktop.DBus.Monitoring"),
+        "BecomeMonitor",
+        &(vec![rule.as_str()], 0u32),
+    )
+    .await
+    .unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let mut stream = zbus::MessageStream::from(&conn);
+    tokio::spawn(async move {
+        let _conn = conn;
+        while let Some(Ok(msg)) =
+            std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)).await
+        {
+            let header = msg.header();
+            if header.message_type() == zbus::message::Type::MethodCall
+                && let Some(member) = header.member()
+            {
+                log.lock().unwrap().push(member.to_string());
+            }
+        }
+    });
+    seen
+}
+
+/// Um tempo para o monitor receber as cópias das chamadas.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(300)).await;
 }
 
 // --- o UPower falso ---------------------------------------------------------
