@@ -1257,6 +1257,7 @@ dependencies = [
  "lucernad-spectrum",
  "pipewire",
  "rustfft",
+ "rustix",
  "serde_json",
  "tempfile",
  "tokio",

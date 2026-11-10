@@ -1,7 +1,8 @@
 use lucernad_spectrum::backend::OutputNode;
 use lucernad_spectrum::dbus::{Bus, Identity};
 use lucernad_spectrum::matching::{
-    ProcFs, Processes, is_descendant, match_nodes, parse_ppid, player_names, search_root,
+    ProcFs, Process, Processes, is_descendant, match_nodes, parse_ppid, player_names, read_process,
+    search_root,
 };
 use lucernad_spectrum::testing::{FakeBus, testdata};
 
@@ -190,4 +191,35 @@ async fn fake_bus_identifies() {
         }
     );
     assert_eq!(bus.identify("b").await, id("b", None));
+}
+
+#[test]
+fn a_recycled_pid_does_not_mix_processes() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid = dir.path().join("500");
+    std::fs::create_dir(&pid).unwrap();
+    std::fs::write(pid.join("stat"), "500 (brave) S 119549 500").unwrap();
+    std::os::unix::fs::symlink("/opt/brave-bin/brave", pid.join("exe")).unwrap();
+    let open = std::fs::File::open(&pid).unwrap();
+
+    // O processo sai e o PID volta para outro antes da leitura: o que já foi
+    // aberto continua sendo o mesmo processo.
+    std::fs::rename(&pid, dir.path().join("velho")).unwrap();
+    std::fs::create_dir(&pid).unwrap();
+    std::fs::write(pid.join("stat"), "500 (bash) S 1 500").unwrap();
+    std::os::unix::fs::symlink("/usr/bin/bash", pid.join("exe")).unwrap();
+    assert_eq!(
+        read_process(&open),
+        Some(Process {
+            ppid: 119549,
+            exe: "brave".into()
+        })
+    );
+    assert_eq!(
+        ProcFs::new(dir.path().to_path_buf()).get(500),
+        Some(Process {
+            ppid: 1,
+            exe: "bash".into()
+        })
+    );
 }
