@@ -980,6 +980,69 @@ async fn changing_city_mid_fetch_publishes_only_the_new_one() {
 }
 
 #[tokio::test]
+async fn offline_error_goes_away_without_subscriber() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = rig_on(dir.path(), |_| {});
+    let c = client(&r.path).await;
+    let place = json!({"offline": true, "location": loc_json(&cacau())});
+    ok(&c, "web.configure", place).await;
+    assert_eq!(r.t.weather.current().data["error"], OFFLINE_WEATHER);
+
+    // O offline desligado sem assinante: o erro sai, e a busca espera alguém
+    // assinar.
+    let place = json!({"offline": false, "location": loc_json(&cacau())});
+    ok(&c, "web.configure", place).await;
+    let v = r.t.weather.current().data;
+    assert_eq!(v["state"], "loading", "{v}");
+    assert!(v.get("error").is_none(), "o erro do offline ficou: {v}");
+
+    // O mesmo com a conexão que cai e volta.
+    r.f.link.set(Link::Offline);
+    wait_until(LONG, "sem conexão", || {
+        r.t.weather.current().data["error"] == NO_LINK
+    })
+    .await;
+    r.f.link.set(Link::Unknown);
+    wait_until(LONG, "o erro de conexão sai", || {
+        r.t.weather.current().data.get("error").is_none()
+    })
+    .await;
+    assert_eq!(r.t.weather.current().data["state"], "loading");
+    assert_eq!(r.f.http.count(), 0, "sem assinante, nada sai");
+}
+
+#[tokio::test]
+async fn new_city_and_offline_together_never_show_loading() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = rig_on(dir.path(), |_| {});
+    let c = client(&r.path).await;
+    let seq = record(&r.path, "web.weather").await;
+    r.f.http.hold();
+    let place = json!({"offline": false, "location": loc_json(&cacau())});
+    ok(&c, "web.configure", place).await;
+    // A letra em voo também: o offline a refaz (lendo o cache) no meio da
+    // troca, e o `loading` de antes do erro chegaria ao assinante.
+    c.subscribe(&["web.lyrics"]).await.unwrap();
+    track(&c, &tempo_perdido()).await;
+    wait_until(LONG, "A e a letra em voo", || r.f.http.in_flight() == 2).await;
+    let from = seq.len();
+    let place = json!({"offline": true, "location": loc_json(&ariquemes())});
+    ok(&c, "web.configure", place).await;
+    wait_seq(&seq, from, "o erro do offline", |v| {
+        v["location"] == loc_json(&ariquemes()) && v["error"] == OFFLINE_WEATHER
+    })
+    .await;
+    r.f.http.release();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let flashes: Vec<Value> = seq.all()[from..]
+        .iter()
+        .filter(|v| v["state"] == "loading")
+        .cloned()
+        .collect();
+    assert!(flashes.is_empty(), "loading passageiro: {flashes:?}");
+}
+
+#[tokio::test]
 async fn city_search_results() {
     let dir = tempfile::tempdir().unwrap();
     let r = rig_on(dir.path(), |_| {});
