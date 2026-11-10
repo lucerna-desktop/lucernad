@@ -2,8 +2,10 @@
 //! `<pasta>/{lyrics,weather}/<sha256 da chave>.json`, com `{savedAt, value}`.
 //!
 //! A escrita é atômica (`.tmp-*` e `rename`), a leitura é limitada a
-//! [`ENTRY_MAX`] bytes, o arquivo estragado é apagado e, depois de cada
-//! escrita, os mais antigos (pelo `mtime`) saem até o total caber no limite.
+//! [`ENTRY_MAX`] bytes e não segue link nem espera um FIFO, o arquivo
+//! estragado é apagado e, depois de cada escrita, os mais antigos (pelo
+//! `mtime`) saem até o total caber no limite. A poda só entra nas pastas de
+//! verdade (uma pasta trocada por um link fica de fora).
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
@@ -13,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lucerna_paths::create_private_dir;
+use rustix::fs::{Mode, OFlags};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -68,17 +71,29 @@ impl Cache {
 
     /// Lê a entrada: quando foi guardada (com resolução de segundo) e o valor.
     /// Arquivo estragado, grande demais ou sem `savedAt` vale como ausente e
-    /// é apagado.
+    /// é apagado; o que não é um arquivo comum (um link, um FIFO) também.
     pub fn get(&self, kind: Kind, key: &str) -> Option<(SystemTime, Value)> {
         let path = self.path(kind, key);
-        let mut file = match File::open(&path) {
-            Ok(f) => f,
-            Err(_) => return None,
+        // O `O_NOFOLLOW` recusa o link (`ELOOP`) e o `O_NONBLOCK` não espera
+        // quem escreva num FIFO; o tipo é conferido no arquivo aberto.
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let mut file = match rustix::fs::open(&path, flags, Mode::empty()) {
+            Ok(fd) => File::from(fd),
+            Err(rustix::io::Errno::NOENT) => return None,
+            Err(_) => {
+                let _ = fs::remove_file(&path);
+                return None;
+            }
         };
+        let regular = file.metadata().is_ok_and(|md| md.is_file());
         let mut bytes = Vec::new();
-        let read = (&mut file)
-            .take(ENTRY_MAX as u64 + 1)
-            .read_to_end(&mut bytes);
+        let read = if regular {
+            (&mut file)
+                .take(ENTRY_MAX as u64 + 1)
+                .read_to_end(&mut bytes)
+        } else {
+            Err(io::ErrorKind::InvalidData.into())
+        };
         let parsed = match read {
             Ok(_) if bytes.len() <= ENTRY_MAX => parse(&bytes),
             _ => None,
@@ -122,12 +137,17 @@ impl Cache {
     }
 
     /// Apaga os `.tmp-*` com mais de 1 h e, dos `.json` das duas pastas, os
-    /// mais antigos até o total caber no limite.
+    /// mais antigos até o total caber no limite. Uma pasta que não é pasta
+    /// de verdade (um link para outro lugar) fica de fora.
     fn prune(&self) {
         let now = SystemTime::now();
         let mut entries: Vec<(SystemTime, PathBuf, u64)> = Vec::new();
         for kind in Kind::ALL {
-            let Ok(read) = fs::read_dir(self.dir.join(kind.dir_name())) else {
+            let sub = self.dir.join(kind.dir_name());
+            if !sub.symlink_metadata().is_ok_and(|md| md.is_dir()) {
+                continue;
+            }
+            let Ok(read) = fs::read_dir(&sub) else {
                 continue;
             };
             for entry in read.flatten() {

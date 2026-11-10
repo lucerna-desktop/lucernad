@@ -1289,6 +1289,7 @@ dependencies = [
  "lucernad-core",
  "lucernad-web",
  "reqwest",
+ "rustix",
  "rustls",
  "serde_json",
  "sha2",
