@@ -100,7 +100,7 @@ Métodos:
 
 - `web.track {artist, title, album?, duration?}` → `{}`: a faixa tocando (o shell manda a cada troca; a busca espera 500 ms sem nova troca, e pular faixas em sequência não faz uma busca por faixa).
 - `web.configure {offline, vagalumeKey?, location?, refresh?}` → `{}`: substitui **toda** a configuração (campo opcional ausente volta ao padrão; `refresh` de 5 a 1440 minutos, padrão 30). `location` é `{name, latitude, longitude}`.
-- `web.searchCity {query}` → `{"results":[{"name","state","country","countryCode","latitude","longitude"}]}`: até 5 cidades.
+- `web.searchCity {query}` → `{"results":[{"name","state","country","countryCode","latitude","longitude"}]}`: até 5 cidades. Se o modo offline ligar ou a conexão cair no meio, a busca para com o `1001` ou o `1002`.
 - `web.refresh {}` → `{}`: busca o clima já e refaz a letra com erro.
 
 Erros: `-32602` para parâmetro inválido (o texto não ecoa o valor); `1001` "Modo offline ligado: a busca de cidade usa a internet."; `1002` "Sem conexão com a internet."; `1003` "Não consegui falar com o Open-Meteo: …"; `1004` com o módulo indisponível (também o `web.track` e o `web.configure`).

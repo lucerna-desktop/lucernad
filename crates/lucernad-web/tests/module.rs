@@ -1084,6 +1084,64 @@ async fn city_search_results() {
 }
 
 #[tokio::test]
+async fn city_search_in_flight_stops_when_going_offline() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = rig_on(dir.path(), |_| {});
+    let c = client(&r.path).await;
+    online(&c).await;
+    for (go_offline, code, text) in [
+        (
+            true,
+            1001,
+            "Modo offline ligado: a busca de cidade usa a internet.",
+        ),
+        (false, 1002, NO_LINK),
+    ] {
+        r.f.http.hold();
+        let searcher = client(&r.path).await;
+        let search = tokio::spawn(async move {
+            call(&searcher, "web.searchCity", json!({"query": "Cacau"})).await
+        });
+        wait_until(LONG, "a busca em voo", || r.f.http.in_flight() == 1).await;
+        if go_offline {
+            ok(&c, "web.configure", json!({"offline": true})).await;
+        } else {
+            r.f.link.set(Link::Offline);
+        }
+        let result = tokio::time::timeout(LONG, search)
+            .await
+            .expect("a busca não parou")
+            .unwrap();
+        assert_eq!(rpc_error(result), (code, text.to_string()));
+        wait_until(LONG, "o pedido abortado", || r.f.http.in_flight() == 0).await;
+        r.f.http.release();
+        r.f.link.set(Link::Unknown);
+        online(&c).await;
+    }
+}
+
+#[tokio::test]
+async fn city_search_sees_the_link_before_the_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = rig_on(dir.path(), |_| {});
+    let c = client(&r.path).await;
+    online(&c).await;
+    // A troca da conexão vale já, mesmo antes de o laço a ver.
+    for _ in 0..20 {
+        r.f.link.set(Link::Offline);
+        assert_eq!(
+            rpc_error(call(&c, "web.searchCity", json!({"query": "Cacau"})).await),
+            (1002, NO_LINK.to_string())
+        );
+        r.f.link.set(Link::Unknown);
+        call(&c, "web.searchCity", json!({"query": "Cacau"}))
+            .await
+            .expect("de novo online");
+    }
+    assert_eq!(requests_to(&r.f, "/v1/search").len(), 20);
+}
+
+#[tokio::test]
 async fn refresh_fetches_now_without_subscriber() {
     let dir = tempfile::tempdir().unwrap();
     let r = rig_on(dir.path(), |_| {});
