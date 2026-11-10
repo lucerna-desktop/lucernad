@@ -450,6 +450,19 @@ impl Ctx {
         .await
     }
 
+    /// Antes de qualquer `configure` e sem histórico no disco, não há item a
+    /// achar: quem só procura um (o `lucernad copiar` como primeiro cliente)
+    /// não aplica o padrão, que criaria um `history.db` vazio, mesmo com a
+    /// persistência desligada no shell.
+    fn nothing_stored(&self) -> bool {
+        self.shared.settings.borrow().is_none()
+            && self
+                .shared
+                .data_dir
+                .as_deref()
+                .is_some_and(|dir| !store::exists(dir))
+    }
+
     /// O [`Ctx::blocking`] depois da configuração.
     async fn with_store<T: Send + 'static>(
         &self,
@@ -577,6 +590,9 @@ impl Ctx {
 
     async fn get(self, p: Value) -> Result<Value, RpcError> {
         let id = id_of(&p)?;
+        if self.nothing_stored() {
+            return Err(gone(id));
+        }
         // O texto vem cortado em `GET_TEXT_MAX`, com `truncated` (a resposta
         // cabe numa mensagem; o shell nunca precisa do texto inteiro).
         self.with_store(move |_, store| store.get(id).map_err(internal)?.ok_or_else(|| gone(id)))
@@ -585,13 +601,17 @@ impl Ctx {
 
     async fn copy(self, p: Value) -> Result<Value, RpcError> {
         let id = id_of(&p)?;
+        if self.nothing_stored() {
+            return Err(gone(id));
+        }
         let (kind, mime, data) = self
             .with_store(move |_, store| store.locate(id).map_err(internal)?.ok_or_else(|| gone(id)))
             .await?;
-        // O arquivo da imagem é lido sem o lock.
+        // O arquivo da imagem é lido sem o lock; sumido, o item saiu no meio.
         let data = join(tokio::task::spawn_blocking(move || data.read()))
             .await
-            .map_err(internal)?;
+            .map_err(internal)?
+            .ok_or_else(|| gone(id))?;
         let source = Source {
             offers: offers_for(kind, mime.as_deref(), &data, id),
         };

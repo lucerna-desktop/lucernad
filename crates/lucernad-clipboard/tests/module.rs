@@ -1154,3 +1154,54 @@ async fn copy_from_history_works_during_light_mode() {
     assert_eq!(r.fake.paste(TEXT).as_deref(), Some(&b"antigo"[..]));
     light.send(false).unwrap();
 }
+
+#[tokio::test]
+async fn copy_of_an_image_whose_file_vanished_is_gone() {
+    let r = rig();
+    let c = ready(&r).await;
+    let photo = r.dir.path().join("foto.png");
+    std::fs::write(&photo, png_bytes(16, 16)).unwrap();
+    let result = call(&c, "clipboard.copyImage", json!({"path": photo}))
+        .await
+        .unwrap();
+    let id = result["id"].as_i64().unwrap();
+    // O item apagado entre o `locate` e a leitura: o arquivo some antes.
+    let item = call(&c, "clipboard.get", json!({"id": id})).await.unwrap();
+    std::fs::remove_file(item["image"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        rpc_error(call(&c, "clipboard.copy", json!({"id": id})).await),
+        (1001, format!("O item {id} não existe mais."))
+    );
+}
+
+#[tokio::test]
+async fn first_lookup_without_history_creates_none() {
+    // O `lucernad copiar` como primeiro cliente: sem o shell, sem assinante.
+    let r = rig();
+    let c = client(&r.path).await;
+    let start = Instant::now();
+    assert_eq!(
+        rpc_error(call(&c, "clipboard.copy", json!({"id": 99})).await),
+        (1001, "O item 99 não existe mais.".to_string())
+    );
+    assert_eq!(
+        rpc_error(call(&c, "clipboard.get", json!({"id": 99})).await),
+        (1001, "O item 99 não existe mais.".to_string())
+    );
+    // Sem esperar o padrão (o `configure_wait` é de 200 ms).
+    assert!(start.elapsed() < Duration::from_millis(150));
+    assert!(!r.data().exists(), "{:?}", files_in(&r.data()));
+    assert_eq!(history(&r.t), Value::Null);
+}
+
+#[tokio::test]
+async fn first_lookup_finds_the_history_of_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let id = history_before(dir.path(), vec![NewClip::Text("de antes".into())])[0];
+    let r = rig_in(dir, FakeBackend::new(), |_| {});
+    let c = client(&r.path).await;
+    let item = call(&c, "clipboard.get", json!({"id": id})).await.unwrap();
+    assert_eq!(item["text"], "de antes");
+    call(&c, "clipboard.copy", json!({"id": id})).await.unwrap();
+    assert_eq!(r.fake.paste("text/plain").unwrap(), b"de antes");
+}

@@ -360,6 +360,11 @@ pub fn prepare(clip: NewClip, files_dir: &Path) -> Result<Prepared, String> {
     }
 }
 
+/// Se há um histórico no disco em `dir` (o `history.db`).
+pub fn exists(dir: &Path) -> bool {
+    dir.join(DB_FILE).exists()
+}
+
 /// Apaga o histórico do disco em `dir`: `history.db`, `-wal`, `-shm` e
 /// `images/`.
 pub fn wipe(dir: &Path) -> Result<(), String> {
@@ -388,11 +393,16 @@ pub enum Data {
 }
 
 impl Data {
-    /// Os bytes; o arquivo é lido agora (bloqueia).
-    pub fn read(self) -> Result<Vec<u8>, String> {
+    /// Os bytes; o arquivo é lido agora (bloqueia). `None` se o arquivo já
+    /// não existe: o item saiu depois do [`Store::locate`].
+    pub fn read(self) -> Result<Option<Vec<u8>>, String> {
         match self {
-            Data::Bytes(bytes) => Ok(bytes),
-            Data::File(path) => fs::read(&path).map_err(|e| format!("{}: {e}", path.display())),
+            Data::Bytes(bytes) => Ok(Some(bytes)),
+            Data::File(path) => match fs::read(&path) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(format!("{}: {e}", path.display())),
+            },
         }
     }
 }
@@ -1006,7 +1016,7 @@ impl Store {
         let Some((kind, mime, data)) = self.locate(id)? else {
             return Ok(None);
         };
-        Ok(Some((kind, mime, data.read()?)))
+        Ok(data.read()?.map(|bytes| (kind, mime, bytes)))
     }
 
     /// O [`Store::content`] sem ler o arquivo da imagem: quem chama o lê com
