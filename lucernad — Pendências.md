@@ -78,8 +78,8 @@ Baixo risco, adiadas na revisão final.
 Adiadas na revisão do módulo `power` (lucernad#14).
 
 - [x] Cada escrita na integrada faz 4 chamadas D-Bus ao logind (dá para usar um `GetAll` e guardar o `Type`/`Seat` da sessão). Resolvido na branch `fix/power-sobras`: um `GetAll` da sessão traz o `Active`, o `Type` e o `Seat` juntos; cada escrita faz duas chamadas (o `GetAll` e o `SetBrightness`), sem precisar guardar o `Type`/`Seat`, e a sonda conta as chamadas por um monitor do D-Bus de mentira.
-- [x] Um `GetHistory` que falha derruba o histórico inteiro (o último bom poderia ficar, com o erro ao lado). Resolvido na branch `fix/power-sobras`: a leitura que falha publica os `points` da última leitura boa com o `error` ao lado (o formato é o mesmo; o README diz isso).
-- [x] Os perfis ficam sem estado inicial se a primeira leitura falha (só voltam no próximo `PropertiesChanged` ou `NameOwnerChanged`). Resolvido na branch `fix/power-sobras`: uma leitura incerta é refeita a cada 2 s (`PROFILES_READ_RETRY`) até dar certo, sem esperar um sinal.
+- [x] Um `GetHistory` que falha derruba o histórico inteiro (o último bom poderia ficar, com o erro ao lado). Resolvido na branch `fix/power-sobras`: a leitura que falha publica os `points` da última leitura boa ainda na última hora, com o `error` ao lado (o formato é o mesmo; o README diz isso).
+- [x] Os perfis ficam sem estado inicial se a primeira leitura falha (só voltam no próximo `PropertiesChanged` ou `NameOwnerChanged`). Resolvido na branch `fix/power-sobras`: uma leitura incerta é refeita sem esperar um sinal, em 2 s (`PROFILES_READ_RETRY`) e dobrando a cada falha seguida até 30 s.
 - [x] O `O_NOFOLLOW` do `TreeWriter` vale só no último componente do caminho. Resolvido na branch `fix/power-sobras`: o caminho canônico é aberto do `/` com um `openat` por componente, com `O_NOFOLLOW` (e `O_DIRECTORY` nos do meio); um link em qualquer ponto é recusado.
 - [ ] `EBUSY` no endereço 0x50 (EDID) sem tentar o `I2C_SLAVE_FORCE`.
 - [ ] Docks DisplayLink (monitores sem barramento i2c de placa de vídeo) ficam de fora.
