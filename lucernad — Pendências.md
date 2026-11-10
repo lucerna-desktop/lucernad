@@ -33,6 +33,10 @@ Ligados a itens de outros repositórios:
 - [ ] **Pacote do `lucernad`:** um PKGBUILD neste repositório. Hoje ele é instalado à mão pelos comandos do README e precisa ser recompilado e reinstalado a cada merge. O AUR e as outras distros estão no item 14 das Pendências do `lucerna-shell`.
 - [ ] **Versões casadas com o shell:** o pacote do shell pede uma versão mínima do `lucernad` (hoje o casamento é o `dev/lucernad.rev` do shell), então os dois repositórios ganham tags e releases juntos; o `CHANGELOG` vem com elas. Parte do marco 6 do roteiro nas Pendências do `lucerna-shell`.
 
+## Dependências
+
+- [ ] Migrar para o zbus 6: o Dependabot #22 (fechado) quebrou o build (`zbus::fdo::DBusProxy`, `zbus::proxy` e `zbus::Proxy`). Também ficaram para depois: nvml-wrapper 0.13, rusqlite 0.41, sha2 0.11 e rustix.
+
 ## Sobras do módulo de sistema
 
 - [x] **Uso da Intel na primeira amostra:** o fdinfo precisa de duas leituras, então ao abrir a aba Desempenho o uso da Intel fica "—" por ~2 s. Dá para tirar uma leitura curta extra no primeiro ciclo. Resolvido na branch `fix/power-sobras`: sem a leitura anterior, o amostrador lê o fdinfo duas vezes com 200 ms entre elas (no máximo o intervalo), e o uso já sai na primeira amostra.
@@ -42,21 +46,14 @@ Ligados a itens de outros repositórios:
 
 Baixo risco, adiadas na revisão final.
 
-- [ ] **Captura, por dentro (`lucernad-spectrum/src/pipewire.rs`):**
-  - quando um client sai, o grafo não é reenviado;
-  - um nó novo só é ligado no próximo tique (até 100 ms);
-  - um alvo que o WirePlumber recusa sempre é recriado a cada ~600 ms, sem log nem teto;
-  - a sessão não espera a thread do PipeWire terminar;
+- [ ] **Captura, por dentro (`lucernad-spectrum/src/pipewire.rs`), o que falta:**
+  - um nó novo só é ligado no próximo tique (até 100 ms). Não achei o caminho no código: o laço só conhece o `object.serial` pelo `Graph`, que sai depois de o nó entrar no registro, então o `Capture` sempre o encontra e abre o fluxo na hora; o atraso que sobra é o da nova tentativa de um fluxo destruído, que agora tem espera própria (abaixo). Reproduzir na sonda do PipeWire isolado antes de mexer;
   - a sonda que liga a captura logo que o nó aparece não confere o link player → sink.
-- [ ] **Threads presas por sessão:** com o `/proc` travado para sempre, cada ciclo de assinatura deixa uma thread de casamento presa. O limite de um casamento em voo vale por sessão, não para o processo todo.
-- [ ] **Casamento:**
-  - o `/proc` é lido em duas vezes (`stat` e `exe`), então um PID reciclado no meio pode misturar processos;
-  - um prazo do D-Bus estourado não refaz a conexão;
-  - com `LUCERNA_TEST_HOST_BUS`, o PID do host é procurado no `/proc` do container.
-- [ ] **Análise:**
-  - se dois nós do mesmo player vierem com taxas diferentes, o analisador é recriado a cada amostra e o anel quase para;
-  - com o player pausado e os nós ainda casados, as FFTs seguem rodando sem publicar;
-  - a `magnitudes_db` cria o planejador da FFT a cada chamada.
+- [x] **Captura, por dentro:** quando um client sai, o grafo não é reenviado; um alvo que o WirePlumber recusa sempre é recriado a cada ~600 ms, sem log nem teto; a sessão não espera a thread do PipeWire terminar. Resolvido na branch `fix/spectrum-sobras`: o `State` da thread ficou genérico no fluxo e nas ligações dos clients (testes de unidade sem PipeWire); a saída de um client reenvia o `Graph`; a espera da nova tentativa dobra a cada falha seguida do mesmo nó (0,5 s até o teto de 8 s, sem desistir), com log na primeira falha e ao chegar no teto, e zera quando um fluxo chega a rodar; o `open` espera a thread da sessão anterior (ou da sonda) terminar, até o prazo da conexão (sonda nova `a_new_session_opens_after_the_old_one_ends`, ainda não rodada no PipeWire isolado).
+- [x] **Threads presas por sessão:** com o `/proc` travado para sempre, cada ciclo de assinatura deixa uma thread de casamento presa. O limite de um casamento em voo vale por sessão, não para o processo todo. Resolvido na branch `fix/spectrum-sobras`: o casamento em voo e a época ficaram no laço do módulo, que atravessa as sessões; a sessão nova sobe a época (o resultado preso de uma anterior não vale) e espera o em voo terminar antes de começar outro.
+- [ ] **Casamento, o que falta:** com `LUCERNA_TEST_HOST_BUS`, o PID do host é procurado no `/proc` do container.
+- [x] **Casamento:** o `/proc` é lido em duas vezes (`stat` e `exe`), então um PID reciclado no meio pode misturar processos; um prazo do D-Bus estourado não refaz a conexão. Resolvido na branch `fix/spectrum-sobras`: a pasta `/proc/<pid>` é aberta uma vez e o `stat`, o `exe` e o `cmdline` saem dela (`openat`/`readlinkat`); o prazo estourado no PID do dono (a chamada ao próprio barramento) esquece a conexão e a próxima identificação reconecta (o do `DesktopEntry` não, porque quem responde é o player), testado numa conexão ponto a ponto que nunca responde.
+- [x] **Análise:** se dois nós do mesmo player vierem com taxas diferentes, o analisador é recriado a cada amostra e o anel quase para; com o player pausado e os nós ainda casados, as FFTs seguem rodando sem publicar; a `magnitudes_db` cria o planejador da FFT a cada chamada. Resolvido na branch `fix/spectrum-sobras`: os anéis guardam a taxa de cada nó e a janela soma só os da taxa do nó fresco de menor serial (o analisador só é recriado quando ela muda); sem amostra fresca, o `Analyzer::idle` faz o quadro de silêncio sem as FFTs (igual ao de zeros); o planejador e a janela da `magnitudes_db` ficam num `OnceLock`.
 - [ ] **"Capturando" depois de recarregar o shell:** o `spectrum.status` fica `capturing: true` por alguns segundos depois de um reload do Quickshell. A causa provável é o socket da geração antiga do shell ainda aberto; conferir com `ss -x` logo após um reload.
 
 ## Sobras do módulo da área de transferência
