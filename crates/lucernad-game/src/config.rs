@@ -2,7 +2,7 @@
 //! (substitui tudo; campo ausente = o padrão).
 
 use lucerna_service::RpcError;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// O máximo de classes em cada lista.
 pub const CLASSES_MAX: usize = 100;
@@ -76,6 +76,19 @@ impl Default for GameSettings {
             light: true,
         }
     }
+}
+
+/// O `game.defaults`: a configuração de fábrica no Formato do
+/// `game.configure` (o shell lê a lista "nunca" daqui em vez de copiá-la).
+pub fn defaults() -> Value {
+    let d = GameSettings::default();
+    json!({
+        "auto": {"fullscreen": d.auto_fullscreen, "games": d.auto_games},
+        "always": d.always,
+        "never": d.never,
+        "compositor": {"effects": d.effects, "vrr": d.vrr, "tearing": d.tearing},
+        "system": {"profile": d.profile, "gamemode": d.gamemode, "light": d.light},
+    })
 }
 
 /// O campo `key`; `null` conta como ausente.

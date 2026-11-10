@@ -142,6 +142,7 @@ Métodos:
 - `game.toggle {}` → `{"active"}`.
 - `game.configure {auto: {fullscreen, games}, always: [classe], never: [classe], compositor: {effects, vrr, tearing}, system: {profile, gamemode, light}}` → `{}`: substitui **toda** a configuração (campo ausente = padrão: tudo ligado menos o tearing, `always` vazia, `never` a de fábrica; até 100 classes de até 128 caracteres, comparadas inteiras e sem distinguir maiúsculas).
 - `game.get {}` → o `game.state` atual (para a linha de comando).
+- `game.defaults {}` → a configuração de fábrica no formato do `game.configure` (`{auto, always, never, compositor, system}`, com a lista `never` inteira): para o shell mostrar e partir da lista "nunca" de fábrica sem copiá-la. É fixa e responde mesmo com o módulo parado; um método e não um campo do `game.status`, que o módulo troca por `{"available": false, "error"}` quando para.
 
 Erros: `-32602` para parâmetro inválido; `1002` com o módulo parado.
 

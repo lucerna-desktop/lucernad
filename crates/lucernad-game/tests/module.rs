@@ -521,6 +521,19 @@ async fn shutdown_restores_everything() {
 }
 
 #[tokio::test]
+async fn defaults_publish_the_factory_lists() {
+    let r = rig();
+    let c = r.client().await;
+    let d = r.call(&c, "game.defaults", json!({})).await;
+    assert_eq!(d, lucernad_game::config::defaults());
+    assert_eq!(d["never"][0], json!("mpv"));
+    // Sem efeito no estado: nada é configurado.
+    r.windows(vec![win("0xa1", 4321, "kitty", 2)]);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(!active(&state_until(&c, |_| true).await));
+}
+
+#[tokio::test]
 async fn bad_params_are_32602() {
     let r = rig();
     let c = r.client().await;

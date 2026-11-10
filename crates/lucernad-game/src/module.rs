@@ -4,8 +4,9 @@
 //! perfil, GameMode e modo leve; ao virar inativo, desfaz ao contrário.
 //!
 //! Tópicos: `game.state` e `game.status`; métodos: `game.set`,
-//! `game.toggle`, `game.configure` (o Formato do plano) e `game.get` (o
-//! `game.state` atual, para a linha de comando).
+//! `game.toggle`, `game.configure` (o Formato do plano), `game.get` (o
+//! `game.state` atual, para a linha de comando) e `game.defaults` (a
+//! configuração de fábrica, no Formato do `game.configure`).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -23,7 +24,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::bus::{BusChoice, BusError, GameBus, NoGameBus, TreeGame, ZbusGame, choose, timed};
 use crate::compositor::{apply, apply_after_reload, restore};
-use crate::config::{GameSettings, parse};
+use crate::config::{GameSettings, defaults, parse};
 use crate::detect::{GameCache, ProcRoot};
 use crate::journal::{Journal, Store};
 use crate::state::{AUTO_EXIT, FULLSCREEN_ENTER, Machine, Trigger, triggers};
@@ -181,7 +182,7 @@ fn unavailable() -> RpcError {
 }
 
 /// Declara os tópicos `game.state` e `game.status` e os métodos `game.set`,
-/// `game.toggle`, `game.configure` e `game.get`.
+/// `game.toggle`, `game.configure`, `game.get` e `game.defaults`.
 pub fn register(server: &mut ServerBuilder, cfg: GameConfig, work: WorkTracker) -> Game {
     let topics = GameTopics {
         state: server.topic("game.state", initial_state()),
@@ -210,6 +211,8 @@ pub fn register(server: &mut ServerBuilder, cfg: GameConfig, work: WorkTracker) 
         let state = state.clone();
         async move { Ok(state.current().data) }
     });
+    // Fixo e fora do laço: responde mesmo com o laço parado.
+    server.method("game.defaults", |_p| async { Ok(defaults()) });
     let t = tx;
     server.method("game.configure", move |p| {
         let t = t.clone();
