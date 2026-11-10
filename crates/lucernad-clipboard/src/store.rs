@@ -651,7 +651,9 @@ impl Store {
     /// `secure_delete`: o índice é refeito dos itens (o FTS5 sem o
     /// `secure-delete` guardava os trigramas do apagado nos segmentos) e o
     /// `VACUUM` reescreve o arquivo sem as páginas livres. Um banco novo só
-    /// ganha a marca.
+    /// ganha a marca. A limpeza é só a melhor tentativa: se falha (o `VACUUM`
+    /// pede espaço do tamanho do banco), vai ao log, o histórico abre assim
+    /// mesmo e a próxima abertura tenta de novo.
     fn clean_once(&self, existed: bool) -> Result<(), String> {
         let cleaned: bool = self
             .conn
@@ -665,10 +667,14 @@ impl Store {
             return Ok(());
         }
         if existed {
-            self.conn
+            let cleaned = self
+                .conn
                 .execute("INSERT INTO items_fts(items_fts) VALUES ('rebuild')", [])
-                .map_err(err)?;
-            self.conn.execute_batch("VACUUM").map_err(err)?;
+                .and_then(|_| self.conn.execute_batch("VACUUM"));
+            if let Err(e) = cleaned {
+                eprintln!("lucernad: não consegui limpar o histórico antigo: {e}");
+                return Ok(());
+            }
         }
         // A marca só depois do `VACUUM`: se cair no meio, a próxima abertura
         // refaz.
