@@ -808,3 +808,22 @@ fn history_from_before_secure_delete_is_vacuumed_once() {
         .unwrap();
     assert_eq!(marked, 1);
 }
+
+#[test]
+fn busy_checkpoint_does_not_fail_the_removal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("clipboard");
+    let mut store = disk_at(&dir);
+    let (id, _) = add(&mut store, t("apagado com leitor aberto"), 1);
+    add(&mut store, t("fica"), 2);
+    // Outro leitor com uma leitura aberta: o checkpoint volta ocupado
+    // (depois do `busy_timeout`, 5 s).
+    let reader = rusqlite::Connection::open(dir.join("history.db")).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(store.remove(id), Ok(true));
+    reader.execute_batch("COMMIT").unwrap();
+    assert_eq!(previews(&all(&store)), ["fica"]);
+}
