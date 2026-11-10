@@ -109,7 +109,14 @@ CREATE TRIGGER IF NOT EXISTS items_au AFTER UPDATE OF norm ON items BEGIN
     INSERT INTO items_fts(items_fts, rowid, norm) VALUES ('delete', old.id, old.norm);
     INSERT INTO items_fts(rowid, norm) VALUES (new.id, new.norm);
 END;
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value) WITHOUT ROWID;
 ";
+
+/// A marca, na `meta`, de que o apagado de antes do `secure_delete` já foi
+/// zerado (o índice refeito e o `VACUUM`). Numa tabela, não no
+/// `user_version`: o esquema não muda, e um `lucernad` mais velho segue
+/// abrindo o banco.
+const CLEANED: &str = "cleaned";
 
 const COLUMNS: &str =
     "id, kind, hash, text, mime, width, height, size, lines, file, created, used, pinned";
@@ -586,6 +593,13 @@ impl Store {
                 "o histórico é da versão {version}, mais nova que a {SCHEMA_VERSION}"
             ));
         }
+        let existed: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE name = 'items'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(err)?;
         conn.execute_batch(SCHEMA).map_err(err)?;
         // O índice também esquece de verdade o que sai (SQLite 3.42+).
         conn.execute(
@@ -600,6 +614,7 @@ impl Store {
             origin,
             limit,
         };
+        store.clean_once(existed)?;
         store.remove_orphans()?;
         store.set_limit(limit)?;
         Ok(store)
@@ -620,6 +635,40 @@ impl Store {
 
     fn images(&self) -> PathBuf {
         images_in(&self.files_dir())
+    }
+
+    /// Zera, uma vez na vida do banco, o que foi apagado antes do
+    /// `secure_delete`: o índice é refeito dos itens (o FTS5 sem o
+    /// `secure-delete` guardava os trigramas do apagado nos segmentos) e o
+    /// `VACUUM` reescreve o arquivo sem as páginas livres. Um banco novo só
+    /// ganha a marca.
+    fn clean_once(&self, existed: bool) -> Result<(), String> {
+        let cleaned: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM meta WHERE key = ?1",
+                [CLEANED],
+                |row| row.get(0),
+            )
+            .map_err(err)?;
+        if cleaned {
+            return Ok(());
+        }
+        if existed {
+            self.conn
+                .execute("INSERT INTO items_fts(items_fts) VALUES ('rebuild')", [])
+                .map_err(err)?;
+            self.conn.execute_batch("VACUUM").map_err(err)?;
+        }
+        // A marca só depois do `VACUUM`: se cair no meio, a próxima abertura
+        // refaz.
+        self.conn
+            .execute("INSERT INTO meta(key, value) VALUES (?1, 1)", [CLEANED])
+            .map_err(err)?;
+        if existed {
+            self.forget();
+        }
+        Ok(())
     }
 
     fn remove_orphans(&self) -> Result<(), String> {
@@ -655,9 +704,10 @@ impl Store {
         }
     }
 
-    /// Os não fixados acima do limite saem, por `used` mais antigo; devolve os
-    /// arquivos deles para apagar depois do `COMMIT`.
-    fn evict(tx: &Transaction, limit: usize) -> Result<Vec<String>, String> {
+    /// Os não fixados acima do limite saem, por `used` mais antigo; devolve
+    /// os itens, para apagar os arquivos deles e zerar o `-wal` depois do
+    /// `COMMIT` (pelo [`Store::evicted`]).
+    fn evict(tx: &Transaction, limit: usize) -> Result<Vec<Record>, String> {
         let mut stmt = tx
             .prepare(&format!(
                 "SELECT {COLUMNS} FROM items WHERE pinned = 0
@@ -669,13 +719,21 @@ impl Store {
             .map_err(err)?
             .collect::<Result<_, _>>()
             .map_err(err)?;
-        let mut files = Vec::new();
-        for record in old {
+        for record in &old {
             tx.execute("DELETE FROM items WHERE id = ?1", [record.id])
                 .map_err(err)?;
-            files.extend(record.files());
         }
-        Ok(files)
+        Ok(old)
+    }
+
+    /// Depois do `COMMIT` do corte: os arquivos dos que saíram e o `-wal`.
+    fn evicted(&self, records: &[Record]) {
+        if records.is_empty() {
+            return;
+        }
+        let files: Vec<String> = records.iter().flat_map(Record::files).collect();
+        self.delete_files(&files);
+        self.forget();
     }
 
     /// Grava a cópia preparada: o id e se é nova. A repetida (mesmo hash) só
@@ -754,7 +812,7 @@ impl Store {
         };
         let evicted = Self::evict(&tx, self.limit)?;
         tx.commit().map_err(err)?;
-        self.delete_files(&evicted);
+        self.evicted(&evicted);
         Ok((id, new))
     }
 
@@ -779,16 +837,25 @@ impl Store {
             .execute("DELETE FROM items WHERE id = ?1", [id])
             .map_err(err)?;
         self.delete_files(&record.files());
-        self.forget()?;
+        self.forget();
         Ok(true)
     }
 
     /// Passa o `-wal` para o banco e o zera: as versões antigas das páginas
-    /// (com o que foi apagado) não ficam no disco.
-    fn forget(&self) -> Result<(), String> {
-        self.conn
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
-            .map_err(err)
+    /// (com o que foi apagado) não ficam no disco. A falha só vai ao log: o
+    /// apagado já saiu do histórico (quem chama publica a revisão nova), e o
+    /// resto sai no próximo checkpoint.
+    fn forget(&self) {
+        let busy = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                row.get::<_, i64>(0)
+            });
+        match busy {
+            Ok(0) => {}
+            Ok(_) => eprintln!("lucernad: o -wal do histórico não foi zerado: banco ocupado"),
+            Err(e) => eprintln!("lucernad: o -wal do histórico não foi zerado: {e}"),
+        }
     }
 
     /// Fixa ou solta o item; `false` se ele não existe. Soltar pode tirar
@@ -826,7 +893,7 @@ impl Store {
         tx.commit().map_err(err)?;
         let files: Vec<String> = records.iter().flat_map(Record::files).collect();
         self.delete_files(&files);
-        self.forget()?;
+        self.forget();
         Ok(records.len())
     }
 
@@ -836,7 +903,7 @@ impl Store {
         let tx = self.conn.transaction().map_err(err)?;
         let evicted = Self::evict(&tx, limit)?;
         tx.commit().map_err(err)?;
-        self.delete_files(&evicted);
+        self.evicted(&evicted);
         Ok(())
     }
 
