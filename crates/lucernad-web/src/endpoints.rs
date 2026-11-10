@@ -41,7 +41,7 @@ impl Endpoints {
 
 /// Lê o `LUCERNAD_WEB_BASE`: ausente ou vazio → `Ok(None)`;
 /// `http://127.0.0.1:<porta>` ou `http://[::1]:<porta>` (porta de 1 a 65535,
-/// sem caminho nem usuário) → `Ok(Some(base))`; qualquer outra coisa → o
+/// sem zero à esquerda, sem caminho nem usuário) → `Ok(Some(base))`; qualquer outra coisa → o
 /// erro, nunca a rede de verdade.
 pub fn base_from_env(value: Option<&OsStr>) -> Result<Option<String>, String> {
     let Some(value) = value else {
@@ -56,6 +56,7 @@ pub fn base_from_env(value: Option<&OsStr>) -> Result<Option<String>, String> {
         .find_map(|prefix| text.strip_prefix(prefix))
         .ok_or_else(|| INVALID_BASE.to_string())?;
     let valid = !port.is_empty()
+        && !port.starts_with('0')
         && port.len() <= 5
         && port.bytes().all(|b| b.is_ascii_digit())
         && port.parse::<u32>().is_ok_and(|p| (1..=65535).contains(&p));

@@ -109,7 +109,7 @@ Erros: `-32602` para parâmetro inválido (o texto não ecoa o valor); `1001` "M
 
 **O Vagalume:** só é usado com a chave **do próprio usuário**, criada no site deles (<https://auth.vagalume.com.br/settings/api/>), mandada no `vagalumeKey` do `web.configure`; sem chave, nunca é consultado. A chave nunca aparece em log, tópico, mensagem de erro nem linha de comando. Os dados do Open-Meteo são CC BY 4.0 ("Weather data by Open-Meteo.com"), de uso livre só não comercial.
 
-O `LUCERNAD_WEB_BASE` é **só de teste**: `http://127.0.0.1:<porta>` (ou `http://[::1]:<porta>`) aponta as quatro fontes para um servidor local, com o cache numa subpasta própria e sem redirecionamento; qualquer outro valor deixa o módulo indisponível, nunca na rede de verdade.
+O `LUCERNAD_WEB_BASE` é **só de teste**: `http://127.0.0.1:<porta>` (ou `http://[::1]:<porta>`, a porta sem zero à esquerda) aponta as quatro fontes para um servidor local, com o cache numa subpasta própria e sem redirecionamento; qualquer outro valor deixa o módulo indisponível, nunca na rede de verdade.
 
 ### `hyprland`
 
