@@ -243,7 +243,7 @@ async fn instrumental_or_empty_is_none() {
         });
         assert_eq!(
             find(&http, &want(), key).await.unwrap(),
-            Found::None { vagalume: false }
+            Found::Instrumental
         );
         assert_eq!(urls(&http), vec![get_url()]);
     }
@@ -578,6 +578,9 @@ fn none_expires_and_a_new_key_retries() {
     assert!(!lyrics::fresh(&none, t, t + day * 8, false));
     assert!(!lyrics::fresh(&none, t, t, true));
     assert!(lyrics::fresh(&Found::None { vagalume: true }, t, t, true));
+    // A instrumental confirmada pela LRCLIB não volta ao Vagalume com a chave.
+    assert!(lyrics::fresh(&Found::Instrumental, t, t, true));
+    assert!(!lyrics::fresh(&Found::Instrumental, t, t + day * 8, true));
     let found = Found::Lyrics(Lyrics {
         synced: false,
         lines: vec![Line {
@@ -592,6 +595,7 @@ fn none_expires_and_a_new_key_retries() {
     for f in [
         none,
         Found::None { vagalume: true },
+        Found::Instrumental,
         found,
         Found::Lyrics(Lyrics {
             synced: true,

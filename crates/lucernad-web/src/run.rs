@@ -256,7 +256,7 @@ fn lyrics_empty(key: &str, state: &str, error: Option<&str>) -> Value {
 /// O `web.lyrics` com o resultado de uma busca (ou do cache).
 fn lyrics_found(key: &str, found: &Found) -> Value {
     match found {
-        Found::None { .. } => lyrics_empty(key, "none", None),
+        Found::None { .. } | Found::Instrumental => lyrics_empty(key, "none", None),
         Found::Lyrics(Lyrics {
             synced,
             lines,

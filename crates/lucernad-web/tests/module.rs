@@ -552,6 +552,50 @@ async fn none_is_cached_and_failure_is_not() {
 }
 
 #[tokio::test]
+async fn instrumental_is_not_fetched_again_with_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = rig_on(dir.path(), |_| {});
+    r.f.http.route(&format!("{BASE}/lrclib"), |_| {
+        let mut entry = lrclib_entry("Legião Urbana", "Tempo Perdido", 201.0, None, None);
+        entry["instrumental"] = json!(true);
+        Ok(reply(200, entry))
+    });
+    let c = client(&r.path).await;
+    ok(
+        &c,
+        "web.configure",
+        json!({"offline": false, "vagalumeKey": "CHAVE"}),
+    )
+    .await;
+    c.subscribe(&["web.lyrics"]).await.unwrap();
+    let seq = record(&r.path, "web.lyrics").await;
+    let tp = tempo_perdido().key();
+    let other = missing("Outra");
+
+    track(&c, &tempo_perdido()).await;
+    let (i, v) = wait_seq(&seq, 0, "instrumental", |v| is(v, &tp, "none")).await;
+    assert_eq!(
+        v,
+        json!({"key": tp, "state": "none", "synced": false, "lines": [], "source": ""})
+    );
+    track(&c, &other).await;
+    let (i, _) = wait_seq(&seq, i, "outra", |v| is(v, &other.key(), "none")).await;
+    let before = r.f.http.count();
+    track(&c, &tempo_perdido()).await;
+    wait_seq(&seq, i, "instrumental de novo", |v| is(v, &tp, "none")).await;
+    assert_eq!(
+        r.f.http.count(),
+        before,
+        "a instrumental foi buscada de novo"
+    );
+    assert!(
+        requests_to(&r.f, "/search.php")
+            .iter()
+            .all(|q| param(q, "mus") != Some("Tempo Perdido"))
+    );
+}
+
+#[tokio::test]
 async fn skipping_tracks_never_shows_old_lyrics() {
     let dir = tempfile::tempdir().unwrap();
     let r = rig_on(dir.path(), |_| {});

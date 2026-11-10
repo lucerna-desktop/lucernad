@@ -2,7 +2,7 @@
 //! [`same_track`]) e, só com a chave, o Vagalume.
 //!
 //! A ordem do [`find`]: o `get` da LRCLIB com `syncedLyrics` acaba ali, e
-//! com `instrumental: true` acaba sem letra; com só `plainLyrics`, o texto fica como reserva e a busca tenta uma
+//! com `instrumental: true` acaba sem letra ([`Found::Instrumental`]); com só `plainLyrics`, o texto fica como reserva e a busca tenta uma
 //! sincronizada que case (achou → ela; não achou ou a busca falhou → a
 //! reserva, sem ir ao Vagalume). Sem nada do `get`, a busca: uma sincronizada
 //! que case, senão uma de texto que case; nada → o Vagalume (com a chave).
@@ -65,11 +65,13 @@ pub struct Lyrics {
 }
 
 /// O resultado de uma busca: a letra, ou nenhuma (`vagalume` diz se o
-/// Vagalume foi consultado).
+/// Vagalume foi consultado), ou a faixa que o `get` da LRCLIB confirmou como
+/// instrumental (o Vagalume não é consultado, nem com a chave).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Found {
     Lyrics(Lyrics),
     None { vagalume: bool },
+    Instrumental,
 }
 
 impl Found {
@@ -89,6 +91,7 @@ impl Found {
                 v
             }
             Found::None { vagalume } => json!({"state": "none", "vagalume": vagalume}),
+            Found::Instrumental => json!({"state": "instrumental"}),
         }
     }
 
@@ -98,6 +101,7 @@ impl Found {
             "none" => Some(Found::None {
                 vagalume: v.get("vagalume")?.as_bool()?,
             }),
+            "instrumental" => Some(Found::Instrumental),
             "found" => {
                 let lines = v
                     .get("lines")?
@@ -129,15 +133,15 @@ impl Found {
 }
 
 /// O guardado ainda vale? Uma letra, sempre; "nenhuma", até [`NONE_TTL`] e
-/// desde que não haja chave nova do Vagalume que ele ainda não consultou.
+/// desde que não haja chave nova do Vagalume que ele ainda não consultou; a
+/// instrumental, até [`NONE_TTL`] (com ou sem chave).
 pub fn fresh(found: &Found, saved: SystemTime, now: SystemTime, has_key: bool) -> bool {
+    // O relógio que voltou conta como agora.
+    let young = || now.duration_since(saved).unwrap_or(Duration::ZERO) < NONE_TTL;
     match found {
         Found::Lyrics(_) => true,
-        Found::None { vagalume } => {
-            // O relógio que voltou conta como agora.
-            let age = now.duration_since(saved).unwrap_or(Duration::ZERO);
-            age < NONE_TTL && (!has_key || *vagalume)
-        }
+        Found::None { vagalume } => young() && (!has_key || *vagalume),
+        Found::Instrumental => young(),
     }
 }
 
@@ -192,7 +196,7 @@ pub async fn find(
             let entry = entry.as_object().ok_or(LRCLIB_FORMAT)?;
             // O próprio `get` confirmou a faixa como instrumental: encerra.
             if is_instrumental(entry) {
-                return Ok(Found::None { vagalume: false });
+                return Ok(Found::Instrumental);
             }
             let (synced, plain) = entry_lyrics(entry);
             if let Some(lines) = synced {
