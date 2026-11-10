@@ -506,6 +506,72 @@ async fn reload_mid_game_reapplies() {
 }
 
 #[tokio::test]
+async fn user_change_mid_game_survives_tearing_and_configure() {
+    let r = rig();
+    let c = r.client().await;
+    let tearing = json!({"compositor": {"tearing": true}});
+    r.call(&c, "game.configure", tearing.clone()).await;
+    r.a_game(500);
+    r.a_game(501);
+    r.windows(vec![win("0xg", 500, "dota2", 0)]);
+    state_until(&c, active).await;
+    assert_eq!(r.hypr.option(ANIM), Some(Bool(false)));
+    // O usuário liga as animações na mão no meio do jogo (M2).
+    r.hypr.set_option(ANIM, Bool(true));
+    // Uma segunda janela de jogo troca as janelas do tearing.
+    r.windows(vec![win("0xg", 500, "dota2", 0), win("0xh", 501, "cs2", 0)]);
+    until("o tearing na janela nova", || {
+        r.hypr.prop("0xh", "immediate").as_deref() == Some("1")
+    })
+    .await;
+    assert_eq!(r.hypr.option(ANIM), Some(Bool(true)), "a escolha dele fica");
+    // Um configure no meio também não a desliga de novo.
+    r.call(&c, "game.configure", tearing).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(r.hypr.option(ANIM), Some(Bool(true)));
+    assert_eq!(r.hypr.option(BLUR), Some(Bool(false)));
+    r.windows(vec![]);
+    state_until(&c, |v| !active(v)).await;
+    until("o diário apagado", || r.store.load().is_none()).await;
+    let mut want = default_options();
+    want.insert(ANIM.into(), Bool(true));
+    assert_eq!(r.hypr.options(), want);
+}
+
+#[tokio::test]
+async fn reload_with_restore_pending_keeps_the_file() {
+    let r = rig();
+    let c = r.client().await;
+    r.call(&c, "game.set", json!({"on": true})).await;
+    state_until(&c, active).await;
+    // A restauração falha e fica para a nova tentativa.
+    r.hypr.fail_on("eval", HyprError::TimedOut);
+    r.call(&c, "game.set", json!({"on": false})).await;
+    state_until(&c, |v| {
+        v["effects"]["compositor"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("error: "))
+    })
+    .await;
+    // O reload põe o arquivo, que agora tem o desfoque desligado (o mesmo
+    // valor que o modo jogo tinha posto): o arquivo vence (M3).
+    r.hypr.reload(&[
+        (BLUR, Bool(false)),
+        ("decoration:shadow:enabled", Bool(true)),
+        (ANIM, Bool(true)),
+        (VRR, Int(0)),
+    ]);
+    until("o diário apagado", || r.store.load().is_none()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(r.hypr.option(BLUR), Some(Bool(false)), "o do arquivo");
+    assert_eq!(r.hypr.option(ANIM), Some(Bool(true)));
+    assert_eq!(r.hypr.option(VRR), Some(Int(0)));
+    let s = state_until(&c, |v| v["effects"]["compositor"] == json!("off")).await;
+    assert!(!active(&s));
+    until("o WorkGuard solto", || r.work.pending() == 0).await;
+}
+
+#[tokio::test]
 async fn shutdown_restores_everything() {
     let r = rig();
     let c = r.client().await;

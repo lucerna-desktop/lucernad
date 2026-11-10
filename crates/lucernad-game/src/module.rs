@@ -23,7 +23,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::bus::{BusChoice, BusError, GameBus, NoGameBus, TreeGame, ZbusGame, choose, timed};
-use crate::compositor::{apply, apply_after_reload, restore};
+use crate::compositor::{Session, apply, apply_after_reload, restore};
 use crate::config::{GameSettings, defaults, parse};
 use crate::detect::{GameCache, ProcRoot};
 use crate::journal::{Journal, Store};
@@ -318,6 +318,12 @@ struct Run {
     /// O que o compositor recebeu por último: (efeitos, vrr, tearing, janelas).
     comp_key: Option<(bool, bool, bool, Vec<String>)>,
     comp_reload: bool,
+    /// O que o compositor lembra dentro do modo ativo (as opções devolvidas
+    /// ao usuário).
+    session: Session,
+    /// Um reload com a restauração pendente: as opções já voltaram ao
+    /// arquivo, e a nova tentativa só desfaz as janelas (M3).
+    reload_pending: bool,
     comp_error: Option<HyprError>,
     restore_error: Option<HyprError>,
     retry_at: Option<Instant>,
@@ -354,6 +360,8 @@ impl Run {
             journal: None,
             comp_key: None,
             comp_reload: false,
+            session: Session::default(),
+            reload_pending: false,
             comp_error: None,
             restore_error: None,
             retry_at: None,
@@ -448,8 +456,15 @@ impl Run {
     }
 
     fn on_event(&mut self, e: &Event) {
-        if e.name == "configreloaded" && self.journal.is_some() {
+        // Com as opções todas devolvidas ao usuário o diário some, mas o
+        // reload ainda as reaplica (D5).
+        if e.name == "configreloaded"
+            && (self.journal.is_some() || !self.session.released().is_empty())
+        {
             self.comp_reload = true;
+            if self.restore_error.is_some() && !self.active() {
+                self.reload_pending = true;
+            }
         }
         if e.name == CONNECTED || e.name == DISCONNECTED || WINDOW_EVENTS.contains(&e.name.as_str())
         {
@@ -564,6 +579,10 @@ impl Run {
         if !want {
             self.comp_key = None;
             self.comp_error = None;
+            self.session = Session::default();
+            if std::mem::take(&mut self.reload_pending) {
+                self.forget_options(&store);
+            }
             if self.journal.is_some() && (self.retry_at.is_none() || self.stopping) {
                 self.try_restore().await;
             }
@@ -577,15 +596,16 @@ impl Run {
         } else {
             Vec::new()
         };
+        self.reload_pending = false;
         let key = (s.effects, s.vrr, s.tearing, tw.clone());
         if self.comp_key.as_ref() == Some(&key) && !self.comp_reload {
             return;
         }
         let s = s.clone();
         let result = if self.comp_reload {
-            apply_after_reload(&*hypr, &store, &s, &tw).await
+            apply_after_reload(&*hypr, &store, &s, &tw, &mut self.session).await
         } else {
-            apply(&*hypr, &store, &s, &tw).await
+            apply(&*hypr, &store, &s, &tw, &mut self.session).await
         };
         self.comp_key = Some(key);
         self.comp_reload = false;
@@ -618,10 +638,31 @@ impl Run {
             }
             Err(e) => {
                 eprintln!("lucernad: não consegui desfazer o modo jogo no Hyprland: {e}");
+                // O que ficou no disco (sem as opções que o usuário pegou).
+                self.journal = store.load();
                 self.restore_error = Some(e);
                 self.retry_at = Some(Instant::now() + self.timing.restore_retry);
             }
         }
+    }
+
+    /// O reload pôs as opções de volta no arquivo com a restauração
+    /// pendente: elas saem do diário (o valor do arquivo vence, mesmo igual ao
+    /// que o modo jogo tinha posto); as janelas do tearing ficam.
+    fn forget_options(&mut self, store: &Store) {
+        let Some(mut j) = self.journal.take() else {
+            return;
+        };
+        j.entries.clear();
+        if j.is_empty() {
+            store.clear();
+            self.restore_error = None;
+            return;
+        }
+        if let Err(e) = store.save(&j) {
+            eprintln!("lucernad: não consegui gravar o diário do modo jogo: {e}");
+        }
+        self.journal = Some(j);
     }
 
     async fn sync_profile(&mut self, active: bool) {
