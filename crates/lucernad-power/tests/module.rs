@@ -684,9 +684,11 @@ async fn history_only_with_subscriber() {
     .await;
     wait_until(LONG, "a segunda leitura", || r.f.bus.history_calls() >= 2).await;
 
+    // Uma leitura que falha não apaga o histórico: os últimos pontos bons
+    // ficam, com o erro ao lado.
     r.f.bus.history_fails("sem UPower");
-    let failed =
-        json!({"points": [], "error": "Não consegui ler o histórico do UPower: sem UPower."});
+    let mut failed = points.clone();
+    failed["error"] = json!("Não consegui ler o histórico do UPower: sem UPower.");
     wait_until(LONG, "o erro do histórico", || {
         r.t.history.current().data == failed
     })

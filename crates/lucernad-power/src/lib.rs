@@ -164,8 +164,8 @@ impl PowerConfig {
 pub struct PowerTopics {
     /// O comum `power.screens`: `{screens}`; `null` até a primeira descoberta.
     pub screens: Topic,
-    /// O comum `power.history`: `{points}` (e `error`); `null` até a primeira
-    /// leitura.
+    /// O comum `power.history`: `{points}` (e `error`, com os pontos da
+    /// última leitura boa); `null` até a primeira leitura.
     pub history: Topic,
     /// O comum `power.profiles`: `{available, performance}`; `null` até a
     /// primeira leitura (o shell fica com o último valor que conhece).
@@ -377,21 +377,27 @@ impl Power {
     }
 }
 
-/// O histórico: com assinante, lê já e a cada `interval`.
+/// O histórico: com assinante, lê já e a cada `interval`. Uma leitura que
+/// falha não apaga o histórico: ficam os pontos da última leitura boa (vazio
+/// se ainda não houve), com o `error` ao lado.
 async fn history(topic: Topic, bus: Arc<dyn PowerBus>, interval: Duration) {
+    let mut good = Value::Array(Vec::new());
     loop {
         topic.wait_subscribed().await;
         let reading = async {
             loop {
                 let data = match bus.history().await {
-                    Ok(points) => json!({ "points": points_json(&points) }),
+                    Ok(points) => {
+                        good = points_json(&points);
+                        json!({ "points": good })
+                    }
                     Err(e) => {
                         let error = format!(
                             "Não consegui ler o histórico do UPower: {}.",
                             clip_error(e.trim_end_matches('.'))
                         );
                         eprintln!("lucernad: {error}");
-                        json!({ "points": [], "error": error })
+                        json!({ "points": good, "error": error })
                     }
                 };
                 publish_changed(&topic, data);
