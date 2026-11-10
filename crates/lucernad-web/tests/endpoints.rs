@@ -40,6 +40,9 @@ fn test_base_only_on_loopback() {
         "http://127.0.0.1.evil.com:80",
         "http://user@127.0.0.1:8",
         "http://127.0.0.1:70000",
+        "http://127.0.0.1:08080",
+        "http://[::1]:00009",
+        "http://127.0.0.1:+80",
     ] {
         let err = base_from_env(Some(OsStr::new(bad))).expect_err(bad);
         assert!(err.contains("LUCERNAD_WEB_BASE inválido"), "{bad}: {err}");

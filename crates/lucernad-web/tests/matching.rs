@@ -95,3 +95,29 @@ fn empty_first_artists_do_not_match() {
     assert!(!same_track(&w, "Música", "& B", None));
     assert!(!same_track(&want("", "Música", None), "Música", "", None));
 }
+
+#[test]
+fn lowercase_comes_before_stripping_accents() {
+    // O `İ` minúsculo é `i` + o ponto combinante: o ponto sai junto.
+    assert_eq!(normalize("İstanbul"), "istanbul");
+    assert_eq!(normalize("ÀÉÎ"), "aei");
+}
+
+#[test]
+fn suffix_after_any_dash() {
+    for t in [
+        "Faroeste Caboclo – Remastered 2011",
+        "Faroeste Caboclo — Ao Vivo",
+        "Faroeste Caboclo - Live – Remastered",
+    ] {
+        assert_eq!(title_key(t), "faroeste caboclo", "{t}");
+    }
+    assert_eq!(title_key("Música – Parte Final"), "musica parte final");
+}
+
+#[test]
+fn bidi_formatters_are_dropped() {
+    // O isolamento bidi em volta do nome não parte a palavra.
+    assert_eq!(normalize("Le\u{2068}gi\u{2069}ão\u{200f}"), "legiao");
+    assert_eq!(title_key("\u{202b}Tempo Perdido\u{202c}"), "tempo perdido");
+}

@@ -256,7 +256,7 @@ fn lyrics_empty(key: &str, state: &str, error: Option<&str>) -> Value {
 /// O `web.lyrics` com o resultado de uma busca (ou do cache).
 fn lyrics_found(key: &str, found: &Found) -> Value {
     match found {
-        Found::None { .. } => lyrics_empty(key, "none", None),
+        Found::None { .. } | Found::Instrumental => lyrics_empty(key, "none", None),
         Found::Lyrics(Lyrics {
             synced,
             lines,
@@ -407,12 +407,16 @@ impl Loop {
                 self.saved = cache_get(&self.cache, Kind::Weather, new.place_key())
                     .await
                     .and_then(|(t, v)| Some((t, Forecast::from_json(&v)?)));
-                let state = if self.saved.is_some() {
-                    "ready"
+                // Já com a configuração nova: com o offline ligado junto, o
+                // erro vai direto, sem um `loading` passageiro antes.
+                if self.saved.is_some() {
+                    self.publish_weather("ready", None);
+                } else if self.online() {
+                    self.publish_weather("loading", None);
                 } else {
-                    "loading"
-                };
-                self.publish_weather(state, None);
+                    let error = self.offline_text(OFFLINE_WEATHER);
+                    self.publish_weather("error", Some(error));
+                }
             }
         }
         self.transition(was).await;
@@ -558,6 +562,12 @@ impl Loop {
         publish_changed(&self.topics.weather, v);
     }
 
+    /// O `web.weather` mostra o erro do offline (ou da falta de conexão)?
+    fn shows_offline_error(&self) -> bool {
+        let v = self.topics.weather.current().data;
+        v["state"] == "error" && (v["error"] == OFFLINE_WEATHER || v["error"] == NO_LINK)
+    }
+
     fn abort_weather(&mut self) {
         // O `Drop` do `Flight` aborta.
         self.weather = None;
@@ -602,6 +612,11 @@ impl Loop {
         }
         self.due = None;
         if !force && !self.weather_sub {
+            // Sem assinante, o erro do offline que já passou sai: a busca
+            // sai quando alguém assinar.
+            if self.saved.is_none() && self.shows_offline_error() {
+                self.publish_weather("loading", None);
+            }
             return;
         }
         let now = Instant::now();

@@ -77,6 +77,17 @@ fn control_characters_are_removed() {
 }
 
 #[test]
+fn bidi_formatters_are_removed() {
+    // Os formatadores bidi (Cf) saem; o ZWJ dos emojis fica.
+    let text = "\u{2067}a\u{200e}b\u{202e}c\u{2069} \u{61c}d👨\u{200d}👩";
+    assert_eq!(
+        parse_lrc(&format!("[00:01]{text}"))[0].text,
+        "abc d👨\u{200d}👩"
+    );
+    assert_eq!(plain_lines(text)[0].text, "abc d👨\u{200d}👩");
+}
+
+#[test]
 fn plain_lyrics() {
     let lines = plain_lines("a\r\n\r\nb\n\n");
     let line = |t: &str| Line {

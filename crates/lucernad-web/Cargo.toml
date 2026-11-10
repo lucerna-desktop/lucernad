@@ -19,6 +19,7 @@ lucerna-paths.workspace = true
 lucerna-service.workspace = true
 lucernad-core.workspace = true
 reqwest.workspace = true
+rustix.workspace = true
 rustls.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

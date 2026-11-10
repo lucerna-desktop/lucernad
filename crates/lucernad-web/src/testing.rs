@@ -18,7 +18,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::WebConfig;
 use crate::cache::{CACHE_LIMIT, Cache};
@@ -53,6 +53,9 @@ pub struct Reply {
     pub delay: Duration,
     /// Fecha a conexão sem responder.
     pub drop: bool,
+    /// Manda o corpo em pedaços deste tamanho (`Transfer-Encoding: chunked`,
+    /// sem `Content-Length`); `None` manda inteiro.
+    pub chunk: Option<usize>,
 }
 
 impl Reply {
@@ -76,6 +79,7 @@ impl Reply {
             body,
             delay: Duration::ZERO,
             drop: false,
+            chunk: None,
         }
     }
 
@@ -88,6 +92,12 @@ impl Reply {
     /// Acrescenta um cabeçalho; um `Content-Length` substitui o calculado.
     pub fn header(mut self, k: &str, v: &str) -> Reply {
         self.headers.push((k.to_string(), v.to_string()));
+        self
+    }
+
+    /// Manda o corpo em pedaços de `size` bytes, sem `Content-Length`.
+    pub fn chunked(mut self, size: usize) -> Reply {
+        self.chunk = Some(size.max(1));
         self
     }
 
@@ -104,7 +114,7 @@ type Handler = Arc<dyn Fn(&Seen) -> Reply + Send + Sync + 'static>;
 
 /// Um servidor HTTP/1.1 mínimo em 127.0.0.1 (porta livre), numa tarefa do
 /// runtime do teste; uma conexão por pedido (`Connection: close`). Para
-/// quando é solto.
+/// quando é solto, e fecha junto as conexões abertas.
 pub struct LocalServer {
     base: String,
     seen: Arc<Mutex<Vec<Seen>>>,
@@ -122,8 +132,19 @@ impl LocalServer {
         let handler: Handler = Arc::new(handler);
         let log = seen.clone();
         let task = tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(serve(stream, handler.clone(), log.clone()));
+            // As conexões ficam no `JoinSet` da tarefa: abortada a tarefa, ele
+            // cai e aborta cada uma.
+            let mut connections = JoinSet::new();
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => match accepted {
+                        Ok((stream, _)) => {
+                            connections.spawn(serve(stream, handler.clone(), log.clone()));
+                        }
+                        Err(_) => return,
+                    },
+                    Some(_) = connections.join_next() => {}
+                }
             }
         });
         LocalServer {
@@ -165,8 +186,10 @@ async fn serve(mut stream: TcpStream, handler: Handler, log: Arc<Mutex<Vec<Seen>
     }
     let mut head = format!("HTTP/1.1 {} Lucerna\r\nConnection: close\r\n", reply.status);
     // Um `Content-Length` dado no `Reply` substitui o calculado (para um
-    // teste mandar um corpo mais curto que o anunciado).
-    if !reply
+    // teste mandar um corpo mais curto que o anunciado); em pedaços, não há.
+    if reply.chunk.is_some() {
+        head.push_str("Transfer-Encoding: chunked\r\n");
+    } else if !reply
         .headers
         .iter()
         .any(|(k, _)| k.eq_ignore_ascii_case("content-length"))
@@ -179,9 +202,24 @@ async fn serve(mut stream: TcpStream, handler: Handler, log: Arc<Mutex<Vec<Seen>
     head.push_str("\r\n");
     // O cliente pode já ter desistido (prazo, corpo grande demais).
     if stream.write_all(head.as_bytes()).await.is_ok() {
-        let _ = stream.write_all(&reply.body).await;
+        let _ = match reply.chunk {
+            None => stream.write_all(&reply.body).await,
+            Some(size) => write_chunked(&mut stream, &reply.body, size).await,
+        };
         let _ = stream.shutdown().await;
     }
+}
+
+/// O corpo em pedaços de `size` bytes, com o pedaço vazio do fim.
+async fn write_chunked(stream: &mut TcpStream, body: &[u8], size: usize) -> std::io::Result<()> {
+    for piece in body.chunks(size) {
+        stream
+            .write_all(format!("{:x}\r\n", piece.len()).as_bytes())
+            .await?;
+        stream.write_all(piece).await?;
+        stream.write_all(b"\r\n").await?;
+    }
+    stream.write_all(b"0\r\n\r\n").await
 }
 
 /// Lê a linha do pedido e os cabeçalhos (até [`HEAD_MAX`]).

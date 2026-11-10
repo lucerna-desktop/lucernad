@@ -552,6 +552,50 @@ async fn none_is_cached_and_failure_is_not() {
 }
 
 #[tokio::test]
+async fn instrumental_is_not_fetched_again_with_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = rig_on(dir.path(), |_| {});
+    r.f.http.route(&format!("{BASE}/lrclib"), |_| {
+        let mut entry = lrclib_entry("Legião Urbana", "Tempo Perdido", 201.0, None, None);
+        entry["instrumental"] = json!(true);
+        Ok(reply(200, entry))
+    });
+    let c = client(&r.path).await;
+    ok(
+        &c,
+        "web.configure",
+        json!({"offline": false, "vagalumeKey": "CHAVE"}),
+    )
+    .await;
+    c.subscribe(&["web.lyrics"]).await.unwrap();
+    let seq = record(&r.path, "web.lyrics").await;
+    let tp = tempo_perdido().key();
+    let other = missing("Outra");
+
+    track(&c, &tempo_perdido()).await;
+    let (i, v) = wait_seq(&seq, 0, "instrumental", |v| is(v, &tp, "none")).await;
+    assert_eq!(
+        v,
+        json!({"key": tp, "state": "none", "synced": false, "lines": [], "source": ""})
+    );
+    track(&c, &other).await;
+    let (i, _) = wait_seq(&seq, i, "outra", |v| is(v, &other.key(), "none")).await;
+    let before = r.f.http.count();
+    track(&c, &tempo_perdido()).await;
+    wait_seq(&seq, i, "instrumental de novo", |v| is(v, &tp, "none")).await;
+    assert_eq!(
+        r.f.http.count(),
+        before,
+        "a instrumental foi buscada de novo"
+    );
+    assert!(
+        requests_to(&r.f, "/search.php")
+            .iter()
+            .all(|q| param(q, "mus") != Some("Tempo Perdido"))
+    );
+}
+
+#[tokio::test]
 async fn skipping_tracks_never_shows_old_lyrics() {
     let dir = tempfile::tempdir().unwrap();
     let r = rig_on(dir.path(), |_| {});
@@ -936,6 +980,69 @@ async fn changing_city_mid_fetch_publishes_only_the_new_one() {
 }
 
 #[tokio::test]
+async fn offline_error_goes_away_without_subscriber() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = rig_on(dir.path(), |_| {});
+    let c = client(&r.path).await;
+    let place = json!({"offline": true, "location": loc_json(&cacau())});
+    ok(&c, "web.configure", place).await;
+    assert_eq!(r.t.weather.current().data["error"], OFFLINE_WEATHER);
+
+    // O offline desligado sem assinante: o erro sai, e a busca espera alguém
+    // assinar.
+    let place = json!({"offline": false, "location": loc_json(&cacau())});
+    ok(&c, "web.configure", place).await;
+    let v = r.t.weather.current().data;
+    assert_eq!(v["state"], "loading", "{v}");
+    assert!(v.get("error").is_none(), "o erro do offline ficou: {v}");
+
+    // O mesmo com a conexão que cai e volta.
+    r.f.link.set(Link::Offline);
+    wait_until(LONG, "sem conexão", || {
+        r.t.weather.current().data["error"] == NO_LINK
+    })
+    .await;
+    r.f.link.set(Link::Unknown);
+    wait_until(LONG, "o erro de conexão sai", || {
+        r.t.weather.current().data.get("error").is_none()
+    })
+    .await;
+    assert_eq!(r.t.weather.current().data["state"], "loading");
+    assert_eq!(r.f.http.count(), 0, "sem assinante, nada sai");
+}
+
+#[tokio::test]
+async fn new_city_and_offline_together_never_show_loading() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = rig_on(dir.path(), |_| {});
+    let c = client(&r.path).await;
+    let seq = record(&r.path, "web.weather").await;
+    r.f.http.hold();
+    let place = json!({"offline": false, "location": loc_json(&cacau())});
+    ok(&c, "web.configure", place).await;
+    // A letra em voo também: o offline a refaz (lendo o cache) no meio da
+    // troca, e o `loading` de antes do erro chegaria ao assinante.
+    c.subscribe(&["web.lyrics"]).await.unwrap();
+    track(&c, &tempo_perdido()).await;
+    wait_until(LONG, "A e a letra em voo", || r.f.http.in_flight() == 2).await;
+    let from = seq.len();
+    let place = json!({"offline": true, "location": loc_json(&ariquemes())});
+    ok(&c, "web.configure", place).await;
+    wait_seq(&seq, from, "o erro do offline", |v| {
+        v["location"] == loc_json(&ariquemes()) && v["error"] == OFFLINE_WEATHER
+    })
+    .await;
+    r.f.http.release();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let flashes: Vec<Value> = seq.all()[from..]
+        .iter()
+        .filter(|v| v["state"] == "loading")
+        .cloned()
+        .collect();
+    assert!(flashes.is_empty(), "loading passageiro: {flashes:?}");
+}
+
+#[tokio::test]
 async fn city_search_results() {
     let dir = tempfile::tempdir().unwrap();
     let r = rig_on(dir.path(), |_| {});
@@ -974,6 +1081,64 @@ async fn city_search_results() {
             "Não consegui falar com o Open-Meteo: a resposta veio fora do formato.".to_string()
         )
     );
+}
+
+#[tokio::test]
+async fn city_search_in_flight_stops_when_going_offline() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = rig_on(dir.path(), |_| {});
+    let c = client(&r.path).await;
+    online(&c).await;
+    for (go_offline, code, text) in [
+        (
+            true,
+            1001,
+            "Modo offline ligado: a busca de cidade usa a internet.",
+        ),
+        (false, 1002, NO_LINK),
+    ] {
+        r.f.http.hold();
+        let searcher = client(&r.path).await;
+        let search = tokio::spawn(async move {
+            call(&searcher, "web.searchCity", json!({"query": "Cacau"})).await
+        });
+        wait_until(LONG, "a busca em voo", || r.f.http.in_flight() == 1).await;
+        if go_offline {
+            ok(&c, "web.configure", json!({"offline": true})).await;
+        } else {
+            r.f.link.set(Link::Offline);
+        }
+        let result = tokio::time::timeout(LONG, search)
+            .await
+            .expect("a busca não parou")
+            .unwrap();
+        assert_eq!(rpc_error(result), (code, text.to_string()));
+        wait_until(LONG, "o pedido abortado", || r.f.http.in_flight() == 0).await;
+        r.f.http.release();
+        r.f.link.set(Link::Unknown);
+        online(&c).await;
+    }
+}
+
+#[tokio::test]
+async fn city_search_sees_the_link_before_the_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = rig_on(dir.path(), |_| {});
+    let c = client(&r.path).await;
+    online(&c).await;
+    // A troca da conexão vale já, mesmo antes de o laço a ver.
+    for _ in 0..20 {
+        r.f.link.set(Link::Offline);
+        assert_eq!(
+            rpc_error(call(&c, "web.searchCity", json!({"query": "Cacau"})).await),
+            (1002, NO_LINK.to_string())
+        );
+        r.f.link.set(Link::Unknown);
+        call(&c, "web.searchCity", json!({"query": "Cacau"}))
+            .await
+            .expect("de novo online");
+    }
+    assert_eq!(requests_to(&r.f, "/v1/search").len(), 20);
 }
 
 #[tokio::test]

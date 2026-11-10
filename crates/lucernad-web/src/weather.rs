@@ -121,7 +121,8 @@ impl Forecast {
     /// A parte do tópico `web.weather` sem `location`, `state` e
     /// `updatedAt`: `daily` só de hoje em diante (a data local da cidade,
     /// `now + utc_offset`), sem o nascer/pôr por dia; `sunrise`/`sunset` do
-    /// dia de hoje, ou `null`.
+    /// dia de hoje, ou `null`; a umidade e a chance de chuva em porcentagem
+    /// inteira (o cache guarda como veio).
     pub fn view(&self, now: SystemTime) -> Value {
         let secs = now
             .duration_since(UNIX_EPOCH)
@@ -134,13 +135,28 @@ impl Forecast {
             .filter(|d| d.date.as_str() >= today.as_str())
             .collect();
         let current_day = days.iter().find(|d| d.date == today);
+        let mut current = current_json(&self.current);
+        current["humidity"] = json!(percent(self.current.humidity));
+        let daily: Vec<Value> = days
+            .iter()
+            .map(|d| {
+                let mut v = day_json(d, false);
+                v["precipitation"] = json!(d.precipitation.map(percent));
+                v
+            })
+            .collect();
         json!({
-            "current": current_json(&self.current),
-            "daily": days.iter().map(|d| day_json(d, false)).collect::<Vec<_>>(),
+            "current": current,
+            "daily": daily,
             "sunrise": current_day.and_then(|d| d.sunrise.clone()),
             "sunset": current_day.and_then(|d| d.sunset.clone()),
         })
     }
+}
+
+/// Uma porcentagem inteira, arredondada.
+fn percent(p: f64) -> i64 {
+    p.round() as i64
 }
 
 /// Um dia em JSON; `with_sun` põe o nascer e o pôr (o cache guarda; o

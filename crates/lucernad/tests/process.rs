@@ -500,6 +500,31 @@ fn web_cli(dir: &Path) {
         err.contains("Passe --cidade, --lat e --lon juntos"),
         "stderr: {err}"
     );
+    // A latitude e a longitude negativas (o sul e o oeste) passam como números.
+    let out = lucernad(dir)
+        .args([
+            "rede",
+            "--cidade",
+            "Cacaulândia",
+            "--lat",
+            "-10.3375",
+            "--lon",
+            "-62.8986",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (_w, _rx, weather) = watch_json(dir, "web.weather");
+    assert_eq!(
+        weather["data"]["location"],
+        json!({"name": "Cacaulândia", "latitude": -10.3375, "longitude": -62.8986}),
+        "{weather}"
+    );
     let out = lucernad(dir)
         .args(["faixa", "Legião Urbana", "Tempo Perdido", "201"])
         .output()

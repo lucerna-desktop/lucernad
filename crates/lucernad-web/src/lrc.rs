@@ -3,9 +3,11 @@
 //! Texto vindo de fora, então tudo tem limite: [`LINES_MAX`] linhas, até
 //! [`LINE_CHARS_MAX`] caracteres cada e [`TEXT_BYTES_MAX`] bytes de texto
 //! somado. O que passa disso cai (a linha que estouraria a soma cai com as
-//! seguintes). Caracteres de controle são removidos.
+//! seguintes). Caracteres de controle e os formatadores bidi são removidos.
 
 use serde_json::{Value, json};
+
+use crate::text::is_bidi_format;
 
 /// Máximo de linhas de uma letra.
 pub const LINES_MAX: usize = 1000;
@@ -130,12 +132,12 @@ fn parse_offset(tag: &str) -> Option<f64> {
     value.parse::<i64>().ok().map(|v| v as f64)
 }
 
-/// Tira os caracteres de controle e as pontas, e corta em
-/// [`LINE_CHARS_MAX`] caracteres sem copiar o resto.
+/// Tira os caracteres de controle, os formatadores bidi e as pontas, e corta
+/// em [`LINE_CHARS_MAX`] caracteres sem copiar o resto.
 fn clean(s: &str) -> String {
     let text: String = s
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !is_bidi_format(*c))
         .skip_while(|c| c.is_whitespace())
         .take(LINE_CHARS_MAX)
         .collect();

@@ -1,10 +1,11 @@
 //! A conectividade: se há internet, pelo NetworkManager (o D-Bus do sistema).
 //!
 //! O [`NmConnectivity`] lê a propriedade `Connectivity` de
-//! `org.freedesktop.NetworkManager` e relê a cada `PropertiesChanged` do
-//! caminho dele e a cada `NameOwnerChanged` do nome (o NetworkManager saiu
-//! ou voltou). Sem barramento ou sem o nome, o estado é [`Link::Unknown`] (o
-//! módulo tenta a rede), e a conexão é tentada de novo a cada [`RETRY`].
+//! `org.freedesktop.NetworkManager` e relê a cada `PropertiesChanged` da
+//! interface dele (no caminho dele) e a cada `NameOwnerChanged` do nome (o
+//! NetworkManager saiu ou voltou). Sem barramento ou sem o nome, o estado é
+//! [`Link::Unknown`] (o módulo tenta a rede), e a conexão é tentada de novo a
+//! cada [`RETRY`].
 
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
@@ -60,13 +61,15 @@ pub trait Connectivity: Send + Sync + 'static {
     fn watch(&self) -> watch::Receiver<Link>;
 }
 
+/// O lado de quem publica, enquanto a tarefa acompanha (`None` antes do
+/// primeiro `watch` e depois que a tarefa sai).
+type Slot = Arc<Mutex<Option<watch::Sender<Link>>>>;
+
 /// A conectividade pelo NetworkManager no D-Bus do sistema (preguiçosa: nada
 /// é aberto até o primeiro [`Connectivity::watch`]).
 #[derive(Clone)]
 pub struct NmConnectivity {
-    /// O lado de quem publica, enquanto a tarefa acompanha (`None` antes do
-    /// primeiro `watch`).
-    tx: Arc<Mutex<Option<watch::Sender<Link>>>>,
+    tx: Slot,
 }
 
 impl NmConnectivity {
@@ -78,23 +81,38 @@ impl NmConnectivity {
     }
 }
 
+fn lock(slot: &Slot) -> std::sync::MutexGuard<'_, Option<watch::Sender<Link>>> {
+    slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl Connectivity for NmConnectivity {
     fn watch(&self) -> watch::Receiver<Link> {
-        let mut tx = self
-            .tx
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Com algum receptor vivo, a tarefa continua: divide o mesmo `watch`.
-        // Sem nenhum, ela terminou (ou vai terminar, e nunca ganha outro
-        // receptor): começa outra.
-        if let Some(tx) = tx.as_ref().filter(|tx| tx.receiver_count() > 0) {
+        let mut slot = lock(&self.tx);
+        // Com a tarefa no lugar, divide o mesmo `watch`: ela só sai pelo
+        // [`retire`], que confere os receptores com a trava, então este novo
+        // nunca fica num canal morto. Sem ela, começa outra.
+        if let Some(tx) = slot.as_ref() {
             return tx.subscribe();
         }
         let (fresh, rx) = watch::channel(Link::Unknown);
-        tokio::spawn(follow(fresh.clone()));
-        *tx = Some(fresh);
+        tokio::spawn(follow(self.tx.clone(), fresh.clone()));
+        *slot = Some(fresh);
         rx
     }
+}
+
+/// Os receptores caíram: a tarefa sai? Com a trava, confere de novo (um
+/// `watch` pode ter entrado depois do aviso) e, sem nenhum, tira o próprio
+/// `tx` do lugar, para o próximo `watch` começar outra tarefa.
+fn retire(slot: &Slot, tx: &watch::Sender<Link>) -> bool {
+    let mut slot = lock(slot);
+    if tx.receiver_count() > 0 {
+        return false;
+    }
+    if slot.as_ref().is_some_and(|s| s.same_channel(tx)) {
+        *slot = None;
+    }
+    true
 }
 
 /// O que deu errado numa chamada.
@@ -137,14 +155,14 @@ async fn within<T, E: Into<Failure>>(
 /// A tarefa do [`NmConnectivity`]: conecta, acompanha enquanto a conexão
 /// durar e, sem ela, publica [`Link::Unknown`] e tenta de novo em [`RETRY`].
 /// O aviso no log sai só na primeira falha seguida. Termina quando todos os
-/// receptores caem.
-async fn follow(tx: watch::Sender<Link>) {
+/// receptores caem (pelo [`retire`]).
+async fn follow(slot: Slot, tx: watch::Sender<Link>) {
     let mut warned = false;
     loop {
         match within(Connection::system()).await {
             Ok(conn) => {
                 warned = false;
-                if let Ended::Closed = follow_on(&conn, &tx).await {
+                if let Ended::Closed = follow_on(&slot, &conn, &tx).await {
                     return;
                 }
             }
@@ -160,9 +178,15 @@ async fn follow(tx: watch::Sender<Link>) {
             }
         }
         publish(&tx, Link::Unknown);
-        tokio::select! {
-            () = tx.closed() => return,
-            () = tokio::time::sleep(RETRY) => {}
+        let wake = tokio::time::sleep(RETRY);
+        tokio::pin!(wake);
+        loop {
+            tokio::select! {
+                () = tx.closed() => if retire(&slot, &tx) {
+                    return;
+                },
+                () = &mut wake => break,
+            }
         }
     }
 }
@@ -185,8 +209,8 @@ fn publish(tx: &watch::Sender<Link>, now: Link) {
 }
 
 /// Acompanha numa conexão: assina o `NameOwnerChanged` do nome e o
-/// `PropertiesChanged` do caminho, lê o estado e relê a cada sinal.
-async fn follow_on(conn: &Connection, tx: &watch::Sender<Link>) -> Ended {
+/// `PropertiesChanged` da interface, lê o estado e relê a cada sinal.
+async fn follow_on(slot: &Slot, conn: &Connection, tx: &watch::Sender<Link>) -> Ended {
     let mut streams = Vec::new();
     for rule in [owner_rule(), properties_rule()] {
         let stream = match rule {
@@ -205,7 +229,9 @@ async fn follow_on(conn: &Connection, tx: &watch::Sender<Link>) -> Ended {
     publish(tx, current(conn).await);
     loop {
         tokio::select! {
-            () = tx.closed() => return Ended::Closed,
+            () = tx.closed() => if retire(slot, tx) {
+                return Ended::Closed;
+            },
             alive = next_signal(&mut streams) => {
                 if !alive {
                     return Ended::Lost;
@@ -226,12 +252,15 @@ fn owner_rule() -> zbus::Result<MatchRule<'static>> {
         .build())
 }
 
+/// O `PropertiesChanged` só da interface do NetworkManager (o `arg0`): os
+/// das outras interfaces no mesmo caminho não releem nada.
 fn properties_rule() -> zbus::Result<MatchRule<'static>> {
     Ok(MatchRule::builder()
         .msg_type(zbus::message::Type::Signal)
         .path(NM_PATH)?
         .interface("org.freedesktop.DBus.Properties")?
         .member("PropertiesChanged")?
+        .arg(0, NM)?
         .build())
 }
 
@@ -278,4 +307,41 @@ async fn current(conn: &Connection) -> Link {
         Ok::<_, Failure>(link_from(value))
     };
     read.await.unwrap_or(Link::Unknown)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn properties_rule_filters_the_interface() {
+        let rule = properties_rule().unwrap().to_string();
+        assert!(
+            rule.contains("arg0='org.freedesktop.NetworkManager'"),
+            "{rule}"
+        );
+        assert!(rule.contains("member='PropertiesChanged'"), "{rule}");
+    }
+
+    #[test]
+    fn retire_waits_for_the_last_receiver() {
+        let (tx, rx) = watch::channel(Link::Unknown);
+        let slot: Slot = Arc::new(Mutex::new(Some(tx.clone())));
+        // Um receptor entrou depois do aviso: a tarefa continua no lugar.
+        assert!(!retire(&slot, &tx));
+        assert!(lock(&slot).is_some());
+        drop(rx);
+        assert!(retire(&slot, &tx));
+        assert!(lock(&slot).is_none(), "o lugar ficou com o canal morto");
+    }
+
+    #[test]
+    fn retire_keeps_a_newer_task() {
+        let (old, rx) = watch::channel(Link::Unknown);
+        drop(rx);
+        let (newer, _rx) = watch::channel(Link::Online);
+        let slot: Slot = Arc::new(Mutex::new(Some(newer)));
+        assert!(retire(&slot, &old));
+        assert!(lock(&slot).is_some(), "a tarefa nova saiu do lugar");
+    }
 }

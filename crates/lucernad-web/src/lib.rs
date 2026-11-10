@@ -13,7 +13,8 @@
 //! conectividade e dispara as buscas (cada uma numa tarefa própria,
 //! abortável). Até o primeiro `web.configure`, o módulo fica offline: o
 //! daemon sobe antes de o shell dizer se o modo offline está ligado. O
-//! `web.searchCity` roda fora do laço.
+//! `web.searchCity` roda fora do laço e para no meio se o modo offline ligar
+//! ou a conexão cair.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -32,7 +33,7 @@ use crate::http::{
     RetryPolicy,
 };
 use crate::matching::Track;
-use crate::net::{Connectivity, NmConnectivity};
+use crate::net::{Connectivity, Link, NmConnectivity};
 use crate::run::{Reach, Settings};
 use crate::weather::{HttpOrFormat, Location, search_cities};
 
@@ -44,6 +45,7 @@ pub mod lyrics;
 pub mod matching;
 pub mod net;
 mod run;
+mod text;
 pub mod weather;
 
 #[cfg(feature = "testing")]
@@ -205,6 +207,9 @@ struct Ctx {
     requests: Option<mpsc::UnboundedSender<Ask>>,
     /// Se a busca de cidade pode sair (o laço atualiza).
     reach: watch::Receiver<Reach>,
+    /// A conectividade direto da fonte: a troca vale para a busca de cidade
+    /// antes de o laço a ver.
+    link: Arc<dyn Connectivity>,
     http: Arc<dyn Http>,
     endpoints: Endpoints,
     search_policy: RetryPolicy,
@@ -322,18 +327,20 @@ impl Ctx {
         if self.requests.is_none() || !self.available() {
             return Err(self.unavailable());
         }
-        let reach = *self.reach.borrow();
-        match reach {
-            Reach::Off => {
-                return Err(RpcError::app(
-                    OFFLINE,
-                    "Modo offline ligado: a busca de cidade usa a internet.",
-                ));
+        let mut reach = self.reach.clone();
+        let mut link = self.link.watch();
+        let blocked = |reach: Reach, link: Link| match (reach, link) {
+            (Reach::Off, _) => Some(RpcError::app(
+                OFFLINE,
+                "Modo offline ligado: a busca de cidade usa a internet.",
+            )),
+            (Reach::NoLink, _) | (_, Link::Offline) => {
+                Some(RpcError::app(NO_LINK, "Sem conexão com a internet."))
             }
-            Reach::NoLink => {
-                return Err(RpcError::app(NO_LINK, "Sem conexão com a internet."));
-            }
-            Reach::Online => {}
+            (Reach::Online, _) => None,
+        };
+        if let Some(e) = blocked(*reach.borrow_and_update(), *link.borrow_and_update()) {
+            return Err(e);
         }
         let failed = |e: String| {
             RpcError::app(
@@ -341,7 +348,28 @@ impl Ctx {
                 format!("Não consegui falar com o Open-Meteo: {e}."),
             )
         };
-        match search_cities(&*self.http, &self.endpoints, &self.search_policy, &query).await {
+        let search = search_cities(&*self.http, &self.endpoints, &self.search_policy, &query);
+        // O modo offline ligado ou a conexão caída no meio: larga a busca (o
+        // pedido em voo é abortado junto).
+        let stop = async {
+            // Um `watch` cujo lado de quem publica caiu não troca mais.
+            let (mut reach_alive, mut link_alive) = (true, true);
+            loop {
+                tokio::select! {
+                    changed = reach.changed(), if reach_alive => reach_alive = changed.is_ok(),
+                    changed = link.changed(), if link_alive => link_alive = changed.is_ok(),
+                    else => return std::future::pending().await,
+                }
+                if let Some(e) = blocked(*reach.borrow_and_update(), *link.borrow_and_update()) {
+                    return e;
+                }
+            }
+        };
+        let result = tokio::select! {
+            result = search => result,
+            e = stop => return Err(e),
+        };
+        match result {
             Ok(cities) => {
                 let results: Vec<Value> = cities.iter().map(|c| c.to_json()).collect();
                 Ok(json!({ "results": results }))
@@ -430,7 +458,7 @@ pub fn register(server: &mut ServerBuilder, cfg: WebConfig) -> Web {
             http: cfg.http.clone(),
             endpoints: cfg.endpoints.clone(),
             cache: cfg.cache,
-            link: cfg.link,
+            link: cfg.link.clone(),
             policy: cfg.policy,
             settle: cfg.settle,
             weather_retry: cfg.weather_retry,
@@ -444,6 +472,7 @@ pub fn register(server: &mut ServerBuilder, cfg: WebConfig) -> Web {
         status: topics.status.clone(),
         requests,
         reach,
+        link: cfg.link,
         http: cfg.http,
         endpoints: cfg.endpoints,
         search_policy: cfg.search_policy,

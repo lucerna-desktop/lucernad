@@ -93,14 +93,14 @@ Roda **só com assinante** (a letra, só com assinante de `web.lyrics`; o clima,
 | Tópico | O que traz | Quando muda |
 | --- | --- | --- |
 | `web.lyrics` | `{"key","state","synced","lines":[{"time","text"}],"source","url"?,"error"?}`: `state` `found`, `searching`, `none` ou `error`; `time` em segundos (`null` na letra sem tempo); `source` `lrclib` ou `vagalume` (o `url` só com o Vagalume); `null` até o primeiro `web.track` com assinante | a cada faixa e a cada resultado |
-| `web.weather` | `{"location","state","updatedAt","current","daily","sunrise","sunset","error"?}`: `state` `none`, `loading`, `ready` ou `error` (com os dados guardados); `daily` só de hoje em diante, na data local da cidade; °C, km/h e %; `null` até o primeiro `web.configure` | a cada atualização |
+| `web.weather` | `{"location","state","updatedAt","current","daily","sunrise","sunset","error"?}`: `state` `none`, `loading`, `ready` ou `error` (com os dados guardados); `loading` também sem assinante, com a cidade sem previsão guardada (a busca sai quando alguém assina); `daily` só de hoje em diante, na data local da cidade; °C, km/h e % (a umidade e a chance de chuva, `precipitation`, em inteiros); `null` até o primeiro `web.configure` | a cada atualização |
 | `web.status` | `{"available","error","online"}`; `available` `false` com o motivo se o módulo não puder rodar | quando o estado ou a conectividade muda |
 
 Métodos:
 
 - `web.track {artist, title, album?, duration?}` → `{}`: a faixa tocando (o shell manda a cada troca; a busca espera 500 ms sem nova troca, e pular faixas em sequência não faz uma busca por faixa).
 - `web.configure {offline, vagalumeKey?, location?, refresh?}` → `{}`: substitui **toda** a configuração (campo opcional ausente volta ao padrão; `refresh` de 5 a 1440 minutos, padrão 30). `location` é `{name, latitude, longitude}`.
-- `web.searchCity {query}` → `{"results":[{"name","state","country","countryCode","latitude","longitude"}]}`: até 5 cidades.
+- `web.searchCity {query}` → `{"results":[{"name","state","country","countryCode","latitude","longitude"}]}`: até 5 cidades. Se o modo offline ligar ou a conexão cair no meio, a busca para com o `1001` ou o `1002`.
 - `web.refresh {}` → `{}`: busca o clima já e refaz a letra com erro.
 
 Erros: `-32602` para parâmetro inválido (o texto não ecoa o valor); `1001` "Modo offline ligado: a busca de cidade usa a internet."; `1002` "Sem conexão com a internet."; `1003` "Não consegui falar com o Open-Meteo: …"; `1004` com o módulo indisponível (também o `web.track` e o `web.configure`).
@@ -109,7 +109,7 @@ Erros: `-32602` para parâmetro inválido (o texto não ecoa o valor); `1001` "M
 
 **O Vagalume:** só é usado com a chave **do próprio usuário**, criada no site deles (<https://auth.vagalume.com.br/settings/api/>), mandada no `vagalumeKey` do `web.configure`; sem chave, nunca é consultado. A chave nunca aparece em log, tópico, mensagem de erro nem linha de comando. Os dados do Open-Meteo são CC BY 4.0 ("Weather data by Open-Meteo.com"), de uso livre só não comercial.
 
-O `LUCERNAD_WEB_BASE` é **só de teste**: `http://127.0.0.1:<porta>` (ou `http://[::1]:<porta>`) aponta as quatro fontes para um servidor local, com o cache numa subpasta própria e sem redirecionamento; qualquer outro valor deixa o módulo indisponível, nunca na rede de verdade.
+O `LUCERNAD_WEB_BASE` é **só de teste**: `http://127.0.0.1:<porta>` (ou `http://[::1]:<porta>`, a porta sem zero à esquerda) aponta as quatro fontes para um servidor local, com o cache numa subpasta própria e sem redirecionamento; qualquer outro valor deixa o módulo indisponível, nunca na rede de verdade.
 
 ### `hyprland`
 

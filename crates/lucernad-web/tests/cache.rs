@@ -160,3 +160,87 @@ fn unwritable_dir_is_not_fatal() {
     assert!(cache.put(Kind::Lyrics, "k", &json!(1), t(100)).is_err());
     assert_eq!(cache.get(Kind::Lyrics, "k"), None);
 }
+
+#[test]
+fn prune_never_follows_a_link_in_the_other_folder() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("web");
+    let outside = tmp.path().join("fora");
+    fs::create_dir_all(&outside).unwrap();
+    let precious = outside.join("importante.json");
+    fs::write(&precious, vec![b'x'; 8 * 1024]).unwrap();
+    File::options()
+        .write(true)
+        .open(&precious)
+        .unwrap()
+        .set_modified(t(100))
+        .unwrap();
+    let cache = Cache::new(dir.clone(), 4 * 1024);
+    cache
+        .put(Kind::Lyrics, "k", &json!(1), SystemTime::now())
+        .unwrap();
+    std::os::unix::fs::symlink(&outside, dir.join("weather")).unwrap();
+    cache
+        .put(Kind::Lyrics, "k2", &json!(2), SystemTime::now())
+        .unwrap();
+    assert!(precious.exists(), "a poda apagou fora do cache");
+}
+
+/// Lê a entrada numa thread: um `get` que trava falha o teste em vez de
+/// prender a suíte.
+fn get_within(cache: &Cache, kind: Kind, key: &str) -> Option<(SystemTime, serde_json::Value)> {
+    let (cache, key) = (cache.clone(), key.to_string());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(cache.get(kind, &key));
+    });
+    rx.recv_timeout(Duration::from_secs(2))
+        .expect("a leitura do cache travou")
+}
+
+#[test]
+fn reading_never_follows_a_link_nor_blocks_on_a_fifo() {
+    let tmp = TempDir::new().unwrap();
+    let cache = Cache::new(tmp.path().join("web"), 1 << 20);
+    cache.put(Kind::Lyrics, "k", &json!(1), t(100)).unwrap();
+    let path = cache.path(Kind::Lyrics, "k");
+
+    // Um link no lugar do arquivo: não é lido, e quem ele aponta fica.
+    let outside = tmp.path().join("fora.json");
+    fs::write(&outside, br#"{"savedAt": 100, "value": "de fora"}"#).unwrap();
+    fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&outside, &path).unwrap();
+    assert_eq!(get_within(&cache, Kind::Lyrics, "k"), None);
+    assert!(outside.exists());
+    assert!(path.symlink_metadata().is_err(), "o link ficou");
+
+    // Um FIFO no lugar do arquivo: a leitura não trava.
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &path,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o600),
+        0,
+    )
+    .unwrap();
+    assert_eq!(get_within(&cache, Kind::Lyrics, "k"), None);
+    assert!(path.symlink_metadata().is_err(), "o FIFO ficou");
+}
+
+#[test]
+fn unreadable_entry_is_kept() {
+    let tmp = TempDir::new().unwrap();
+    let cache = Cache::new(tmp.path().join("web"), 1 << 20);
+    cache.put(Kind::Lyrics, "k", &json!(1), t(100)).unwrap();
+    let path = cache.path(Kind::Lyrics, "k");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    // Como root a permissão não barra a leitura: não há o que conferir.
+    if File::open(&path).is_ok() {
+        return;
+    }
+    // Um erro que não diz nada da entrada (aqui o `EACCES`) não a apaga.
+    assert_eq!(cache.get(Kind::Lyrics, "k"), None);
+    assert!(path.exists(), "a entrada boa foi apagada");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(cache.get(Kind::Lyrics, "k").is_some());
+}
