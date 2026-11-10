@@ -222,8 +222,9 @@ struct Shared {
     images: Mutex<()>,
     /// O modo jogo.
     game: GameSignal,
-    /// As cópias lidas durante o modo jogo, da mais velha para a mais nova.
-    deferred: Mutex<VecDeque<NewClip>>,
+    /// As cópias lidas durante o modo jogo, da mais velha para a mais nova,
+    /// com o horário de cada uma (ms).
+    deferred: Mutex<VecDeque<(NewClip, i64)>>,
 }
 
 impl Shared {
@@ -504,9 +505,10 @@ impl Ctx {
         Ok(Some(id))
     }
 
-    /// Grava as cópias preparadas na ordem, como se chegassem agora, e
-    /// publica o histórico uma vez (bloqueia).
-    fn insert_all(&self, ps: &[Prepared], now: i64) -> Result<(), String> {
+    /// Grava as cópias preparadas na ordem, cada uma com o horário da cópia,
+    /// e publica o histórico uma vez (bloqueia). O horário só cresce: um
+    /// empate (ou o relógio voltando) não inverte a ordem.
+    fn insert_all(&self, ps: &[(Prepared, i64)]) -> Result<(), String> {
         let Some(db) = self.db.upgrade() else {
             return Ok(());
         };
@@ -514,8 +516,10 @@ impl Ctx {
         let Some(store) = slot.as_mut() else {
             return Ok(());
         };
-        for (i, p) in ps.iter().enumerate() {
-            store.insert_ref(p, now + i as i64)?;
+        let mut last = i64::MIN;
+        for (p, at) in ps {
+            last = (*at).max(last.saturating_add(1));
+            store.insert_ref(p, last)?;
         }
         if !ps.is_empty() {
             self.shared.publish_history(store);
@@ -523,9 +527,9 @@ impl Ctx {
         Ok(())
     }
 
-    /// Guarda uma cópia do modo jogo na fila (a mais velha cai além de
-    /// [`DEFERRED_MAX`]).
-    fn defer(&self, clip: NewClip) {
+    /// Guarda uma cópia do modo jogo na fila, com o horário `at` da cópia (a
+    /// mais velha cai além de [`DEFERRED_MAX`]).
+    fn defer(&self, clip: NewClip, at: i64) {
         let mut q = self
             .shared
             .deferred
@@ -535,7 +539,7 @@ impl Ctx {
             q.pop_front();
             eprintln!("lucernad: o modo jogo descartou uma cópia antiga da fila");
         }
-        q.push_back(clip);
+        q.push_back((clip, at));
     }
 
     /// Pede ao laço para virar dono da seleção com `source`.
@@ -1200,7 +1204,7 @@ impl Module {
                         .map(drop)
                 }
                 Ok(Ok(Some(Got::Deferred(clip)))) => {
-                    ctx.defer(clip);
+                    ctx.defer(clip, now);
                     // O modo jogo acabou no meio: a fila vai já.
                     if !ctx.shared.game.is_on() {
                         flush_deferred(ctx.clone()).await;
@@ -1228,7 +1232,7 @@ enum Got {
 /// Processa a fila do modo jogo: prepara cada cópia, grava todas na ordem e
 /// publica uma vez.
 async fn flush_deferred(ctx: Ctx) {
-    let clips: Vec<NewClip> = ctx
+    let clips: Vec<(NewClip, i64)> = ctx
         .shared
         .deferred
         .lock()
@@ -1238,17 +1242,16 @@ async fn flush_deferred(ctx: Ctx) {
     if clips.is_empty() {
         return;
     }
-    let now = now_ms();
     let job = tokio::task::spawn_blocking(move || {
         let mut ready = Vec::new();
-        for clip in clips {
+        for (clip, at) in clips {
             match ctx.prepare_clip(clip) {
-                Ok(Some(p)) => ready.push(p),
+                Ok(Some(p)) => ready.push((p, at)),
                 Ok(None) => {}
                 Err(e) => eprintln!("lucernad: cópia do modo jogo descartada: {e}"),
             }
         }
-        ctx.insert_all(&ready, now)
+        ctx.insert_all(&ready)
     })
     .await;
     match job {

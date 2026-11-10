@@ -1121,6 +1121,47 @@ async fn light_mode_defers_copies_in_order() {
     );
 }
 
+/// O relógio em milissegundos (a unidade do `used`).
+fn wall_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+#[tokio::test]
+async fn light_mode_copies_keep_their_copy_time() {
+    let (r, light) = light_rig();
+    let c = ready(&r).await;
+    light.send(true).unwrap();
+    tick().await;
+    let start = wall_ms();
+    for (i, s) in ["um", "dois"].iter().enumerate() {
+        text(&r.fake, s);
+        read_started(&r, 1 + i).await;
+        tick().await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let copied_by = wall_ms();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    light.send(false).unwrap();
+    wait_count(&r.t, 2).await;
+    let page = list_all(&c).await;
+    assert_eq!(previews(&page), ["dois", "um"]);
+    // O "copiado há X" conta da cópia, não da descarga depois do jogo.
+    let used: Vec<i64> = items(&page)
+        .iter()
+        .map(|i| i["used"].as_i64().unwrap())
+        .collect();
+    assert!(used[1] < used[0], "a ordem das cópias: {used:?}");
+    for u in &used {
+        assert!(
+            (start..=copied_by).contains(u),
+            "{u} fora de {start}..={copied_by}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn light_mode_queue_drops_oldest_after_fifty() {
     assert_eq!(lucernad_clipboard::DEFERRED_MAX, 50);
