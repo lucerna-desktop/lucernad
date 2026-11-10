@@ -1172,12 +1172,18 @@ async fn copy_of_an_image_whose_file_vanished_is_gone() {
         rpc_error(call(&c, "clipboard.copy", json!({"id": id})).await),
         (1001, format!("O item {id} não existe mais."))
     );
+    // Sem o arquivo (apagado à mão), o registro sai também.
+    wait_count(&r.t, 0).await;
+    assert_eq!(ids(&list_all(&c).await), Vec::<i64>::new());
 }
 
 #[tokio::test]
 async fn first_lookup_without_history_creates_none() {
     // O `lucernad copiar` como primeiro cliente: sem o shell, sem assinante.
-    let r = rig();
+    // O padrão só viria depois de 2 s: a resposta não espera por ele.
+    let r = rig_with(FakeBackend::new(), |cfg| {
+        cfg.configure_wait = Duration::from_secs(2);
+    });
     let c = client(&r.path).await;
     let start = Instant::now();
     assert_eq!(
@@ -1188,8 +1194,7 @@ async fn first_lookup_without_history_creates_none() {
         rpc_error(call(&c, "clipboard.get", json!({"id": 99})).await),
         (1001, "O item 99 não existe mais.".to_string())
     );
-    // Sem esperar o padrão (o `configure_wait` é de 200 ms).
-    assert!(start.elapsed() < Duration::from_millis(150));
+    assert!(start.elapsed() < Duration::from_secs(1));
     assert!(!r.data().exists(), "{:?}", files_in(&r.data()));
     assert_eq!(history(&r.t), Value::Null);
 }

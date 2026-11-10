@@ -607,11 +607,22 @@ impl Ctx {
         let (kind, mime, data) = self
             .with_store(move |_, store| store.locate(id).map_err(internal)?.ok_or_else(|| gone(id)))
             .await?;
-        // O arquivo da imagem é lido sem o lock; sumido, o item saiu no meio.
-        let data = join(tokio::task::spawn_blocking(move || data.read()))
+        // O arquivo da imagem é lido sem o lock. Sumido, o item saiu no meio
+        // (ou o arquivo foi apagado à mão: o registro sai também, para não
+        // ficar na lista sem o que copiar).
+        let read = join(tokio::task::spawn_blocking(move || data.read()))
             .await
-            .map_err(internal)?
-            .ok_or_else(|| gone(id))?;
+            .map_err(internal)?;
+        let Some(data) = read else {
+            self.blocking(move |shared, store| {
+                if store.remove(id).map_err(internal)? {
+                    shared.publish_history(store);
+                }
+                Ok(())
+            })
+            .await?;
+            return Err(gone(id));
+        };
         let source = Source {
             offers: offers_for(kind, mime.as_deref(), &data, id),
         };
