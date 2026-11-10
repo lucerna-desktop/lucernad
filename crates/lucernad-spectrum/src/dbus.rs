@@ -35,11 +35,15 @@ pub trait Bus: Send + Sync + 'static {
     fn identify<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Identity>;
 }
 
+/// Como o [`SessionBus`] abre a conexão.
+pub type Connect = Box<dyn Fn() -> BoxFuture<'static, zbus::Result<Connection>> + Send + Sync>;
+
 /// O D-Bus da sessão do usuário, pelo `zbus`.
 pub struct SessionBus {
     timeout: Duration,
-    /// A conexão guardada; volta a `None` depois de um erro de E/S, para a
-    /// próxima chamada refazer.
+    connect: Connect,
+    /// A conexão guardada; volta a `None` depois de um erro de E/S ou do
+    /// prazo do barramento estourado, para a próxima chamada refazer.
     conn: Mutex<Option<Connection>>,
 }
 
@@ -47,8 +51,15 @@ impl SessionBus {
     /// Um barramento com `timeout` em cada chamada (a conexão, o PID e o
     /// `DesktopEntry`). Não conecta até o primeiro [`Bus::identify`].
     pub fn new(timeout: Duration) -> SessionBus {
+        SessionBus::with_connect(timeout, Box::new(|| Box::pin(Connection::session())))
+    }
+
+    /// O [`SessionBus::new`] com a conexão aberta por `connect` (nos testes,
+    /// uma conexão ponto a ponto).
+    pub fn with_connect(timeout: Duration, connect: Connect) -> SessionBus {
         SessionBus {
             timeout,
+            connect,
             conn: Mutex::new(None),
         }
     }
@@ -58,10 +69,7 @@ impl SessionBus {
         if let Some(conn) = conn.as_ref() {
             return Some(conn.clone());
         }
-        let fresh = timeout(self.timeout, Connection::session())
-            .await
-            .ok()?
-            .ok()?;
+        let fresh = timeout(self.timeout, (self.connect)()).await.ok()?.ok()?;
         *conn = Some(fresh.clone());
         Some(fresh)
     }
@@ -73,6 +81,10 @@ impl SessionBus {
         }
     }
 
+    /// O PID do dono de `name`, pelo próprio barramento. O prazo estourado
+    /// aqui é do barramento (travado ou com a conexão perdida sem erro de
+    /// E/S): a conexão é esquecida. O do `DesktopEntry` não, porque quem
+    /// responde é o player, e um player travado não diz nada da conexão.
     async fn owner_pid(&self, conn: &Connection, name: &BusName<'_>) -> Option<u32> {
         let call = async {
             let proxy = DBusProxy::new(conn).await?;
@@ -81,12 +93,27 @@ impl SessionBus {
                 .await
                 .map_err(zbus::Error::from)
         };
-        match timeout(self.timeout, call).await.ok()? {
+        let Ok(result) = timeout(self.timeout, call).await else {
+            self.forget(conn).await;
+            return None;
+        };
+        match result {
             Ok(pid) => Some(pid),
             Err(err) => {
                 self.forget_on_io(&err).await;
                 None
             }
+        }
+    }
+
+    /// Esquece a conexão guardada se ainda for `conn` (outra chamada pode
+    /// já ter refeito).
+    async fn forget(&self, conn: &Connection) {
+        let mut guard = self.conn.lock().await;
+        if guard.as_ref().is_some_and(|c| {
+            c.unique_name() == conn.unique_name() && c.server_guid() == conn.server_guid()
+        }) {
+            *guard = None;
         }
     }
 

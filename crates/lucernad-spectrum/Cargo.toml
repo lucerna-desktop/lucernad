@@ -29,6 +29,8 @@ zbus.workspace = true
 lucernad-spectrum = { path = ".", features = ["testing"] }
 lucerna-ipc.workspace = true
 tempfile.workspace = true
+# A conexão ponto a ponto do teste do SessionBus.
+zbus = { workspace = true, features = ["p2p"] }
 
 [lints]
 workspace = true
