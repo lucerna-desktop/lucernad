@@ -1,7 +1,8 @@
 //! O amostrador: junta as leituras num ciclo de amostragem.
 //!
 //! Guarda o que precisa de duas leituras (CPU, rede por interface e o fdinfo
-//! do DRM) e o histórico da rede. No começo de um ciclo (sem leitura
+//! do DRM; este, sem a anterior, faz uma leitura curta a mais) e o histórico
+//! da rede. No começo de um ciclo (sem leitura
 //! anterior), repete o último uso da CPU e as últimas taxas, sem pôr ponto no
 //! histórico: o delta de minutos desde o ciclo anterior não diria nada.
 
@@ -27,6 +28,10 @@ use crate::{Roots, read};
 
 /// O prazo de uma leitura das GPUs com a NVML.
 pub const NVIDIA_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A janela da leitura curta do fdinfo na primeira amostra das GPUs (no
+/// máximo o intervalo).
+pub const FIRST_DRM_WINDOW: Duration = Duration::from_millis(200);
 
 /// Os grupos de leitura, um por tópico.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -193,7 +198,9 @@ impl Sampler {
     /// As GPUs de agora.
     ///
     /// O fdinfo só é percorrido com alguma Intel ou NVIDIA ativa (ele dá o uso
-    /// da Intel e diz se alguém está com a NVIDIA aberta). A leitura roda numa
+    /// da Intel e diz se alguém está com a NVIDIA aberta). Com a Intel e sem a
+    /// leitura anterior, ele é lido duas vezes, com [`FIRST_DRM_WINDOW`] entre
+    /// as leituras, para o uso já sair na primeira amostra. A leitura roda numa
     /// thread solta, com prazo: uma NVML presa (ou ainda presa de uma leitura
     /// anterior) faz aquela leitura sair sem ela. Um pânico na leitura é
     /// repassado, para o supervisor do módulo ver.
@@ -206,10 +213,23 @@ impl Sampler {
         if active(Vendor::Intel) || active(Vendor::Nvidia) {
             let start = self.start;
             let clock = move || u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let intel = active(Vendor::Intel);
+            // Sem a leitura anterior (o começo de um ciclo), uma leitura curta
+            // a mais: o uso da Intel já sai nesta amostra, sem ficar sem
+            // valor por um intervalo inteiro.
+            let first = match self.drm_prev.take() {
+                Some(prev) => Some(prev),
+                None if intel => {
+                    let first = scan(&self.roots, &clock);
+                    tokio::time::sleep(FIRST_DRM_WINDOW.min(self.interval)).await;
+                    Some(first)
+                }
+                None => None,
+            };
             let snap = scan(&self.roots, &clock);
             nvidia_open = snap.nvidia_open;
-            if active(Vendor::Intel) {
-                let prev = self.drm_prev.take().unwrap_or_default();
+            if intel {
+                let prev = first.unwrap_or_default();
                 let interval_ms = u64::try_from(self.interval.as_millis()).unwrap_or(u64::MAX);
                 for c in cards
                     .iter()

@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::future::{Future, poll_fn};
 use std::io::{self, Write};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -42,6 +43,11 @@ pub const DBUS_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Sem o D-Bus do sistema, de quanto em quanto tempo os perfis tentam de novo.
 pub const PROFILES_RETRY: Duration = Duration::from_secs(30);
+
+/// Depois de uma leitura incerta dos perfis (um erro ou um prazo estourado
+/// no meio), em quanto tempo ela é refeita (a primeira vez; a espera dobra a
+/// cada falha seguida, até o [`PROFILES_RETRY`]).
+pub const PROFILES_READ_RETRY: Duration = Duration::from_secs(2);
 
 /// O máximo de pontos do histórico publicados (os mais novos).
 pub const MAX_POINTS: usize = 500;
@@ -78,6 +84,8 @@ const GRAPHICAL: [&str; 2] = ["wayland", "x11"];
 
 const LOGIND: &str = "org.freedesktop.login1";
 const LOGIND_USER: &str = "/org/freedesktop/login1/user/self";
+const SESSION: &str = "org.freedesktop.login1.Session";
+const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 const UPOWER: &str = "org.freedesktop.UPower";
 const UPOWER_PATH: &str = "/org/freedesktop/UPower";
 const UPOWER_DEVICE: &str = "org.freedesktop.UPower.Device";
@@ -179,7 +187,8 @@ pub trait PowerBus: Send + Sync + 'static {
 
     /// Os perfis: manda o estado atual e cada mudança (o serviço subir, cair
     /// ou mudar a lista). Sem D-Bus, tenta de novo a cada
-    /// [`PROFILES_RETRY`]. Largar o receptor encerra a tarefa. Precisa de um
+    /// [`PROFILES_RETRY`]; uma leitura que falha, em
+    /// [`PROFILES_READ_RETRY`], dobrando até o [`PROFILES_RETRY`]. Largar o receptor encerra a tarefa. Precisa de um
     /// runtime do `tokio`.
     fn watch_profiles(&self) -> UnboundedReceiver<Profiles>;
 }
@@ -433,7 +442,7 @@ async fn follow_profiles(power: ZbusPower, tx: UnboundedSender<Profiles>) {
     loop {
         match power.bus.connection().await {
             Ok(conn) => {
-                if let Ended::Closed = follow_on(&conn, &tx, &mut last).await {
+                if let Ended::Closed = follow_on(&conn, &tx, &mut last, power.retry).await {
                     return;
                 }
                 power.bus.forget().await;
@@ -463,6 +472,7 @@ async fn follow_on(
     conn: &Connection,
     tx: &UnboundedSender<Profiles>,
     last: &mut Option<Profiles>,
+    retry: Duration,
 ) -> Ended {
     let mut streams = Vec::new();
     for (name, path) in PROFILE_SERVICES {
@@ -484,10 +494,13 @@ async fn follow_on(
         }
     }
     // Os sinais assinados antes da leitura: nenhuma mudança fica no meio.
-    // Uma leitura incerta (`None`) não publica: fica o último estado.
-    if let Some(now) = current_profiles(conn).await {
-        publish(tx, last, now);
-    }
+    // Uma leitura incerta (`None`) não publica (fica o último estado) e é
+    // refeita sem esperar um sinal (sem isso, uma primeira leitura que falha
+    // deixaria os perfis sem estado até o serviço mudar): em
+    // [`PROFILES_READ_RETRY`], dobrando a cada falha até o `retry`; uma
+    // leitura certa volta ao começo.
+    let mut wait = PROFILES_READ_RETRY;
+    let mut certain = read_profiles(conn, tx, last).await;
     loop {
         tokio::select! {
             () = tx.closed() => return Ended::Closed,
@@ -495,11 +508,36 @@ async fn follow_on(
                 if !alive {
                     return Ended::Lost;
                 }
-                if let Some(now) = current_profiles(conn).await {
-                    publish(tx, last, now);
-                }
+                certain = read_profiles(conn, tx, last).await;
+            }
+            () = tokio::time::sleep(wait), if !certain => {
+                certain = read_profiles(conn, tx, last).await;
+                wait = next_read_retry(wait, retry);
             }
         }
+        if certain {
+            wait = PROFILES_READ_RETRY;
+        }
+    }
+}
+
+/// A próxima espera depois de uma leitura incerta: o dobro, até `max`.
+pub fn next_read_retry(wait: Duration, max: Duration) -> Duration {
+    (wait * 2).min(max.max(PROFILES_READ_RETRY))
+}
+
+/// Lê os perfis e publica se a leitura foi certa; diz se foi.
+async fn read_profiles(
+    conn: &Connection,
+    tx: &UnboundedSender<Profiles>,
+    last: &mut Option<Profiles>,
+) -> bool {
+    match current_profiles(conn).await {
+        Some(now) => {
+            publish(tx, last, now);
+            true
+        }
+        None => false,
     }
 }
 
@@ -568,6 +606,39 @@ async fn current_profiles(conn: &Connection) -> Option<Profiles> {
     (!uncertain).then_some(NO_PROFILES)
 }
 
+/// O que a escrita confere na sessão do logind.
+struct Session {
+    active: bool,
+    kind: String,
+    /// O id do assento; vazio sem assento.
+    seat: String,
+}
+
+/// O `Active`, o `Type` e o `Seat` do `GetAll` da sessão; faltar um (ou vir
+/// com outro tipo) é erro, como seria a leitura de cada um.
+fn session_from(all: &HashMap<String, OwnedValue>) -> Result<Session, Failure> {
+    let missing = |name: &str| {
+        Failure::Bus(zbus::Error::Failure(format!(
+            "o logind não mandou o {name} da sessão"
+        )))
+    };
+    let active = all
+        .get("Active")
+        .and_then(|v| v.downcast_ref::<bool>().ok())
+        .ok_or_else(|| missing("Active"))?;
+    let kind = all
+        .get("Type")
+        .and_then(|v| v.downcast_ref::<&str>().ok())
+        .ok_or_else(|| missing("Type"))?
+        .to_string();
+    let (seat, _) = all
+        .get("Seat")
+        .and_then(|v| v.try_clone().ok())
+        .and_then(|v| <(String, OwnedObjectPath)>::try_from(v).ok())
+        .ok_or_else(|| missing("Seat"))?;
+    Ok(Session { active, kind, seat })
+}
+
 /// Por que não há o caminho da sessão.
 enum NoPath {
     /// O `Display` é `/`: sem sessão gráfica.
@@ -581,7 +652,8 @@ enum NoPath {
 /// A escrita pelo logind: `SetBrightness("backlight", <dispositivo>,
 /// <valor>)` na sessão do `Display` de `/org/freedesktop/login1/user/self`
 /// (a sessão gráfica do usuário). O caminho da sessão fica guardado e é
-/// relido depois de um erro.
+/// relido depois de um erro: cada escrita faz duas chamadas (o `GetAll` da
+/// sessão e o `SetBrightness`).
 pub struct LogindWriter {
     bus: SystemBus,
     session: Mutex<Option<OwnedObjectPath>>,
@@ -615,23 +687,21 @@ impl LogindWriter {
     }
 
     /// Se a sessão `path` pode receber o brilho agora: ativa e gráfica (o
-    /// `Type` `wayland` ou `x11`, ou com assento). Conferido a cada escrita:
-    /// com a troca rápida de usuário, a sessão fica inativa e o brilho é do
-    /// outro usuário.
-    async fn usable(session: &Proxy<'_>) -> Result<(), NoPath> {
-        let active: bool = within(session.get_property("Active"))
-            .await
-            .map_err(NoPath::Failed)?;
-        let kind: String = within(session.get_property("Type"))
-            .await
-            .map_err(NoPath::Failed)?;
-        let (seat, _): (String, OwnedObjectPath) = within(session.get_property("Seat"))
-            .await
-            .map_err(NoPath::Failed)?;
-        if !GRAPHICAL.contains(&kind.as_str()) && seat.is_empty() {
+    /// `Type` `wayland` ou `x11`, ou com assento). Conferido a cada escrita
+    /// (com a troca rápida de usuário, a sessão fica inativa e o brilho é do
+    /// outro usuário), num `GetAll` só: o `Active`, o `Type` e o `Seat` vêm
+    /// juntos.
+    async fn usable(conn: &Connection, path: &OwnedObjectPath) -> Result<(), NoPath> {
+        let read = async {
+            let props = proxy(conn, LOGIND, path.as_str(), PROPERTIES).await?;
+            within(props.call::<_, _, HashMap<String, OwnedValue>>("GetAll", &(SESSION,))).await
+        };
+        let all = read.await.map_err(NoPath::Failed)?;
+        let session = session_from(&all).map_err(NoPath::Failed)?;
+        if !GRAPHICAL.contains(&session.kind.as_str()) && session.seat.is_empty() {
             return Err(NoPath::NoSession);
         }
-        if !active {
+        if !session.active {
             return Err(NoPath::Inactive);
         }
         Ok(())
@@ -663,15 +733,10 @@ impl LogindWriter {
         value: u32,
     ) -> Result<(), NoPath> {
         let call = async {
-            let session = proxy(
-                conn,
-                LOGIND,
-                path.as_str(),
-                "org.freedesktop.login1.Session",
-            )
-            .await
-            .map_err(NoPath::Failed)?;
-            Self::usable(&session).await?;
+            Self::usable(conn, path).await?;
+            let session = proxy(conn, LOGIND, path.as_str(), SESSION)
+                .await
+                .map_err(NoPath::Failed)?;
             within(session.call::<_, _, ()>("SetBrightness", &("backlight", device, value)))
                 .await
                 .map_err(NoPath::Failed)
@@ -696,7 +761,9 @@ impl BacklightWriter for LogindWriter {
 /// A escrita na árvore falsa do `LUCERNAD_POWER_ROOT`: grava o `brightness`
 /// e o `actual_brightness` do backlight, nunca o logind. Cada arquivo passa
 /// pelo `canonicalize` e o que não fica sob a raiz canônica é recusado
-/// ([`OUTSIDE_ROOT`]): um link para o `/sys` de verdade nunca é escrito.
+/// ([`OUTSIDE_ROOT`]): um link para o `/sys` de verdade nunca é escrito. O
+/// caminho canônico é aberto pelo [`open_without_links`]: um link posto em
+/// qualquer componente depois do `canonicalize` também é recusado.
 pub struct TreeWriter {
     pub roots: Roots,
 }
@@ -717,10 +784,9 @@ impl TreeWriter {
         };
         let text = format!("{value}\n");
         for path in std::iter::once(brightness).chain(actual) {
-            // O `O_NOFOLLOW`: um link posto no lugar do arquivo depois do
-            // `canonicalize` é recusado (`ELOOP`), não seguido.
-            let flags = OFlags::WRONLY | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-            let fd = match rustix::fs::open(&path, flags, Mode::empty()) {
+            // Um link posto em qualquer componente depois do `canonicalize`
+            // é recusado (`ELOOP`), não seguido.
+            let fd = match open_without_links(&path, OFlags::WRONLY | OFlags::TRUNC) {
                 Ok(fd) => fd,
                 Err(Errno::LOOP) => return Err(OUTSIDE_ROOT.to_string()),
                 Err(e) => return Err(io_text(&e.into())),
@@ -741,6 +807,47 @@ impl BacklightWriter for TreeWriter {
     fn target(&self) -> &'static str {
         "na árvore de teste"
     }
+}
+
+/// Abre o caminho absoluto `path` com `flags` sem seguir link nenhum: do
+/// `/`, um `openat` por componente, com `O_NOFOLLOW` (e `O_DIRECTORY` nos
+/// diretórios do meio). Um link em qualquer componente dá `ELOOP`; um
+/// caminho relativo, ou com `.` ou `..`, dá `EINVAL` (o caminho é o já
+/// canônico). O `O_CLOEXEC` vai sempre.
+pub fn open_without_links(path: &Path, flags: OFlags) -> Result<OwnedFd, Errno> {
+    use std::path::Component;
+    let mut parts = path.components();
+    if parts.next() != Some(Component::RootDir) {
+        return Err(Errno::INVAL);
+    }
+    let names: Vec<_> = parts
+        .map(|part| match part {
+            Component::Normal(name) => Ok(name),
+            _ => Err(Errno::INVAL),
+        })
+        .collect::<Result<_, _>>()?;
+    let Some((last, dirs)) = names.split_last() else {
+        return Err(Errno::INVAL);
+    };
+    let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut dir = rustix::fs::open("/", dir_flags, Mode::empty())?;
+    for name in dirs {
+        dir = match rustix::fs::openat(&dir, *name, dir_flags, Mode::empty()) {
+            // Um link no lugar de um diretório: o `O_DIRECTORY` com o
+            // `O_NOFOLLOW` pode dar `ENOTDIR`; é o mesmo link recusado.
+            Err(Errno::NOTDIR) if is_link(&dir, name) => return Err(Errno::LOOP),
+            other => other?,
+        };
+    }
+    let flags = flags | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    rustix::fs::openat(&dir, *last, flags, Mode::empty())
+}
+
+/// Se `name` em `dir` é um link (sem segui-lo).
+fn is_link(dir: &OwnedFd, name: &std::ffi::OsStr) -> bool {
+    rustix::fs::statat(dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|st| {
+        rustix::fs::FileType::from_raw_mode(st.st_mode) == rustix::fs::FileType::Symlink
+    })
 }
 
 /// O caminho canônico de `path`, se ficar sob `root` (por componente).

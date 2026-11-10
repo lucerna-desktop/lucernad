@@ -68,7 +68,7 @@ Ajusta o brilho das telas, lê o histórico de consumo da bateria e os perfis de
 | Tópico | O que traz | Quando muda |
 | --- | --- | --- |
 | `power.screens` | `{"screens":[{"id","kind","output"?,"name","value","max","percent","error"?}]}`: as telas com brilho ajustável (`kind` `backlight` ou `ddc`), com o valor real; `null` até a primeira descoberta | a cada ajuste, mudança de fora ou monitor plugado/tirado |
-| `power.history` | `{"points":[{"time","rate","state"}]}`: o histórico de consumo do UPower (vazio sem bateria); `null` até a primeira leitura | a cada leitura (a cada minuto) |
+| `power.history` | `{"points":[{"time","rate","state"}],"error"?}`: o histórico de consumo do UPower (vazio sem bateria); uma leitura que falha traz o `error` e mantém os `points` da última leitura boa que ainda estão na última hora (vazio se não houver); `null` até a primeira leitura | a cada leitura (a cada minuto) |
 | `power.profiles` | `{"available","performance"}`: o serviço de perfis existe e tem o perfil de desempenho; `null` até a primeira leitura | quando o serviço muda |
 | `power.status` | `{"available","error"}`; `false` com o motivo se o módulo não puder rodar | quando o módulo para |
 

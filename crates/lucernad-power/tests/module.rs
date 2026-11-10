@@ -684,6 +684,8 @@ async fn history_only_with_subscriber() {
     .await;
     wait_until(LONG, "a segunda leitura", || r.f.bus.history_calls() >= 2).await;
 
+    // Uma leitura que falha mantém só os pontos bons da última hora: estes,
+    // de 1970, saem.
     r.f.bus.history_fails("sem UPower");
     let failed =
         json!({"points": [], "error": "Não consegui ler o histórico do UPower: sem UPower."});
@@ -697,6 +699,47 @@ async fn history_only_with_subscriber() {
     let calls = r.f.bus.history_calls();
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(r.f.bus.history_calls(), calls, "sem assinante, sem leitura");
+}
+
+/// Uma leitura que falha não apaga o histórico: os pontos da última leitura
+/// boa que ainda estão na última hora ficam, com o erro ao lado.
+#[tokio::test]
+async fn failed_history_keeps_the_last_hour() {
+    let r = rig();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
+    let (old, recent) = (now - 3700, now - 60);
+    r.f.bus.clone().with_history(vec![
+        Point {
+            time: old,
+            rate: 3.0,
+            state: 2,
+        },
+        Point {
+            time: recent,
+            rate: 5.5,
+            state: 2,
+        },
+    ]);
+    let c = client(&r.path).await;
+    c.subscribe(&["power.history"]).await.unwrap();
+    wait_until(LONG, "o histórico", || {
+        r.t.history.current().data["points"]
+            .as_array()
+            .is_some_and(|p| p.len() == 2)
+    })
+    .await;
+    r.f.bus.history_fails("sem UPower");
+    let failed = json!({
+        "points": [{"time": recent, "rate": 5.5, "state": 2}],
+        "error": "Não consegui ler o histórico do UPower: sem UPower.",
+    });
+    wait_until(LONG, "o erro com os pontos bons", || {
+        r.t.history.current().data == failed
+    })
+    .await;
 }
 
 #[tokio::test]

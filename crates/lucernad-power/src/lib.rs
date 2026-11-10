@@ -164,8 +164,9 @@ impl PowerConfig {
 pub struct PowerTopics {
     /// O comum `power.screens`: `{screens}`; `null` até a primeira descoberta.
     pub screens: Topic,
-    /// O comum `power.history`: `{points}` (e `error`); `null` até a primeira
-    /// leitura.
+    /// O comum `power.history`: `{points}` (e `error`, com os pontos da
+    /// última leitura boa que ainda estão na última hora); `null` até a
+    /// primeira leitura.
     pub history: Topic,
     /// O comum `power.profiles`: `{available, performance}`; `null` até a
     /// primeira leitura (o shell fica com o último valor que conhece).
@@ -377,21 +378,31 @@ impl Power {
     }
 }
 
-/// O histórico: com assinante, lê já e a cada `interval`.
+/// O histórico: com assinante, lê já e a cada `interval`. Uma leitura que
+/// falha não apaga o histórico: ficam os pontos da última leitura boa que
+/// ainda estão no período ([`HISTORY_SPAN`], a última hora; vazio se não
+/// houver), com o `error` ao lado.
 async fn history(topic: Topic, bus: Arc<dyn PowerBus>, interval: Duration) {
+    let mut good: Vec<Point> = Vec::new();
     loop {
         topic.wait_subscribed().await;
         let reading = async {
             loop {
                 let data = match bus.history().await {
-                    Ok(points) => json!({ "points": points_json(&points) }),
+                    Ok(points) => {
+                        let data = json!({ "points": points_json(&points) });
+                        good = points;
+                        data
+                    }
                     Err(e) => {
                         let error = format!(
                             "Não consegui ler o histórico do UPower: {}.",
                             clip_error(e.trim_end_matches('.'))
                         );
                         eprintln!("lucernad: {error}");
-                        json!({ "points": [], "error": error })
+                        let since = unix_now().saturating_sub(u64::from(HISTORY_SPAN));
+                        good.retain(|p| u64::from(p.time) >= since);
+                        json!({ "points": points_json(&good), "error": error })
                     }
                 };
                 publish_changed(&topic, data);
@@ -403,6 +414,13 @@ async fn history(topic: Topic, bus: Arc<dyn PowerBus>, interval: Duration) {
             _ = reading => {}
         }
     }
+}
+
+/// Os segundos desde a época, agora (0 com o relógio antes dela).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn points_json(points: &[Point]) -> Value {

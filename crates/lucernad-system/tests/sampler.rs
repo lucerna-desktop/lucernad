@@ -197,3 +197,60 @@ async fn stuck_nvml_is_skipped_and_not_called_again() {
     assert_eq!(g[0].usage, Some(0.5), "solta, a NVML volta a ser lida");
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
+
+/// A máquina de exemplo com um processo (pid 100) usando a Intel
+/// `0000:00:02.0` (o `fdinfo/i915.txt` no fd 3).
+fn intel_roots(tmp: &tempfile::TempDir) -> Roots {
+    let procfs = tmp.path().join("proc");
+    copy_tree(&testdata("machine/proc"), &procfs).unwrap();
+    let dir = procfs.join("100");
+    std::fs::create_dir_all(dir.join("fd")).unwrap();
+    std::fs::create_dir_all(dir.join("fdinfo")).unwrap();
+    std::os::unix::fs::symlink("/dev/dri/renderD128", dir.join("fd/3")).unwrap();
+    std::fs::copy(testdata("fdinfo/i915.txt"), dir.join("fdinfo/3")).unwrap();
+    Roots {
+        procfs,
+        ..Roots::at(&testdata("machine"))
+    }
+}
+
+#[tokio::test]
+async fn intel_usage_comes_in_the_first_sample() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Sampler::new(
+        intel_roots(&tmp),
+        Box::new(NoNvidia),
+        reader(),
+        Duration::from_secs(2),
+    );
+    // O fdinfo precisa de duas leituras: a primeira amostra tira uma leitura
+    // curta a mais, e o uso já vem (o contador parado: 0).
+    let t0 = Instant::now();
+    let g = s.gpus().await;
+    let elapsed = t0.elapsed();
+    let intel = g.iter().find(|g| g.pci == "0000:00:02.0").unwrap();
+    assert_eq!(intel.usage, Some(0.0), "o uso na primeira amostra");
+    assert!(
+        elapsed >= Duration::from_millis(150) && elapsed < Duration::from_secs(5),
+        "a leitura curta: {elapsed:?}"
+    );
+    // As seguintes usam a leitura anterior, sem a espera (a janela curta é
+    // de 200 ms; o limite fica abaixo dela, com folga para a CI carregada).
+    let t0 = Instant::now();
+    let g = s.gpus().await;
+    assert!(
+        t0.elapsed() < Duration::from_millis(190),
+        "{:?}",
+        t0.elapsed()
+    );
+    let intel = g.iter().find(|g| g.pci == "0000:00:02.0").unwrap();
+    assert_eq!(intel.usage, Some(0.0));
+    // Sem a linha de base (a aba fechada e aberta de novo), a espera volta.
+    s.reset(Groups {
+        gpus: true,
+        ..Groups::default()
+    });
+    let t0 = Instant::now();
+    s.gpus().await;
+    assert!(t0.elapsed() >= Duration::from_millis(150));
+}
