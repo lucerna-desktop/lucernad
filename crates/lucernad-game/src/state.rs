@@ -138,6 +138,22 @@ impl Machine {
 
     /// Os gatilhos de agora.
     pub fn update(&mut self, triggers: Vec<Trigger>, now: Instant) {
+        self.set_triggers(triggers, now);
+        self.blind = false;
+        self.recompute(now);
+    }
+
+    /// O Hyprland sumiu: sem gatilhos (o modo automático sai depois da
+    /// espera), mas a trava "desligado na mão" fica até a próxima leitura de
+    /// verdade das janelas, para o jogo ainda aberto não religar o modo.
+    pub fn lost(&mut self, now: Instant) {
+        self.set_triggers(Vec::new(), now);
+        self.blind = true;
+        self.recompute(now);
+    }
+
+    /// Troca os gatilhos, sem recalcular.
+    fn set_triggers(&mut self, triggers: Vec<Trigger>, now: Instant) {
         if !self.effective.is_empty() {
             self.last_effective = Some(now);
         }
@@ -152,17 +168,6 @@ impl Machine {
                 .or_insert(now);
         }
         self.current = triggers;
-        self.blind = false;
-        self.recompute(now);
-    }
-
-    /// O Hyprland sumiu: sem gatilhos (o modo automático sai depois da
-    /// espera), mas a trava "desligado na mão" fica até a próxima leitura de
-    /// verdade das janelas, para o jogo ainda aberto não religar o modo.
-    pub fn lost(&mut self, now: Instant) {
-        self.update(Vec::new(), now);
-        self.blind = true;
-        self.recompute(now);
     }
 
     /// Liga ou desliga na mão.

@@ -745,6 +745,9 @@ async fn lost_hyprland_keeps_the_manual_off_latch() {
     r.hypr.set_unreachable(true);
     r.hypr.emit("openwindow", "x");
     tokio::time::sleep(Duration::from_millis(500)).await;
+    // Um segundo evento, já depois da espera da saída.
+    r.hypr.emit("openwindow", "x");
+    tokio::time::sleep(Duration::from_millis(100)).await;
     let s = state_until(&c, |_| true).await;
     assert_eq!(s["manual"], json!("off"), "{s}");
     // O Hyprland volta com o jogo ainda aberto: continua desligado.

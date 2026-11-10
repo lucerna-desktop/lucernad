@@ -209,6 +209,21 @@ fn manual_off_latch_survives_a_lost_hyprland() {
 }
 
 #[test]
+fn manual_off_latch_survives_a_second_lost_after_the_wait() {
+    let s = settings();
+    let t0 = Instant::now();
+    let mut m = Machine::new();
+    m.update(trig(&[win("0x1", 10, "dota2", 0, 1)], &[1], &[10], &s), t0);
+    m.set_manual(false, t0 + ms(100));
+    m.lost(t0 + ms(200));
+    m.tick(t0 + ms(200) + AUTO_EXIT + ms(100));
+    // Outro evento com o socket ainda fora do ar, já depois da espera.
+    m.lost(t0 + ms(200) + AUTO_EXIT + ms(200));
+    assert_eq!(m.view().manual, Some(false));
+    assert!(!m.view().active);
+}
+
+#[test]
 fn lost_hyprland_leaves_the_automatic_mode() {
     let s = settings();
     let t0 = Instant::now();
