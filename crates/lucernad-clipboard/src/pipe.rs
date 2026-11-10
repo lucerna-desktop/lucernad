@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 
 /// O texto do `clipboard.status` quando não há exibição para observar.
 pub const NO_DISPLAY: &str = "Sem WAYLAND_DISPLAY: o lucernad não sabe qual sessão observar.";
@@ -63,11 +64,23 @@ pub fn read_pipe(
 }
 
 /// Escreve `data` inteiro em `fd` (o pipe de quem cola), sem passar do
-/// `deadline`: o fd vira não bloqueante e cada pedaço espera o `POLLOUT` com
-/// o tempo que falta. Quem não lê dá `ErrorKind::TimedOut`; quem fecha antes
-/// do fim, o erro de pipe quebrado. Bloqueia a thread: chame fora do laço.
+/// `deadline`: o fd fica não bloqueante durante a escrita e cada pedaço
+/// espera o `POLLOUT` com o tempo que falta. Quem não lê dá
+/// `ErrorKind::TimedOut`; quem fecha antes do fim, o erro de pipe quebrado.
+/// Bloqueia a thread: chame fora do laço.
 pub fn write_pipe(fd: impl AsFd, data: &[u8], deadline: Instant) -> std::io::Result<()> {
-    rustix::io::ioctl_fionbio(&fd, true)?;
+    // O fd veio de quem cola, com a mesma descrição de arquivo: o modo é
+    // dela, e volta como estava no fim, deu certo ou não.
+    let flags = fcntl_getfl(&fd)?;
+    fcntl_setfl(&fd, flags | OFlags::NONBLOCK)?;
+    let sent = write_all(&fd, data, deadline);
+    let restored = fcntl_setfl(&fd, flags);
+    sent?;
+    Ok(restored?)
+}
+
+/// O laço do [`write_pipe`], com o fd já não bloqueante.
+fn write_all(fd: impl AsFd, data: &[u8], deadline: Instant) -> std::io::Result<()> {
     let mut rest = data;
     while !rest.is_empty() {
         match rustix::io::write(&fd, rest) {
