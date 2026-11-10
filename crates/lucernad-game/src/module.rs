@@ -406,7 +406,7 @@ impl Run {
             tokio::select! {
                 e = events.recv(), if events_open => match e {
                     Ok(e) => self.on_event(&e),
-                    Err(RecvError::Lagged(_)) => self.schedule_refresh(),
+                    Err(RecvError::Lagged(_)) => self.on_lagged(),
                     Err(RecvError::Closed) => events_open = false,
                 },
                 r = requests.recv(), if requests_open => match r {
@@ -455,6 +455,15 @@ impl Run {
         }
     }
 
+    /// Eventos perdidos: um `configreloaded` pode estar entre eles, e a
+    /// leitura mais segura é a do reload (nada fica com o usuário por engano).
+    fn on_lagged(&mut self) {
+        if self.journal.is_some() || !self.session.released().is_empty() {
+            self.comp_reload = true;
+        }
+        self.schedule_refresh();
+    }
+
     fn on_event(&mut self, e: &Event) {
         // Com as opções todas devolvidas ao usuário o diário some, mas o
         // reload ainda as reaplica (D5).
@@ -462,6 +471,10 @@ impl Run {
             && (self.journal.is_some() || !self.session.released().is_empty())
         {
             self.comp_reload = true;
+            // Confia que o reload veio depois da última aplicação: um evento
+            // atrasado, depois de um apply que já reaplicou e de uma
+            // restauração que falhou, tiraria do diário um antes de verdade
+            // (muito improvável: o laço lê os eventos em ordem e logo).
             if self.restore_error.is_some() && !self.active() {
                 self.reload_pending = true;
             }
@@ -617,8 +630,9 @@ impl Run {
             }
             Err(e) => {
                 eprintln!("lucernad: o modo jogo não conseguiu mexer no Hyprland: {e}");
-                // O que ficou no disco (o diário é gravado antes do eval).
-                self.journal = store.load();
+                // O que ficou no disco (o diário é gravado antes do eval);
+                // sem leitura, o de antes.
+                self.journal = store.load().or(self.journal.take());
                 self.comp_error = Some(e);
                 self.retry_at = Some(Instant::now() + self.timing.restore_retry);
             }
@@ -638,8 +652,9 @@ impl Run {
             }
             Err(e) => {
                 eprintln!("lucernad: não consegui desfazer o modo jogo no Hyprland: {e}");
-                // O que ficou no disco (sem as opções que o usuário pegou).
-                self.journal = store.load();
+                // O que ficou no disco (sem as opções que o usuário pegou);
+                // sem leitura, o de antes.
+                self.journal = store.load().or(Some(j));
                 self.restore_error = Some(e);
                 self.retry_at = Some(Instant::now() + self.timing.restore_retry);
             }

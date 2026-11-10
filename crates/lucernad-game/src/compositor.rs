@@ -29,9 +29,15 @@ const IMMEDIATE: &str = "immediate";
 /// (vazio a cada entrada): os valores que viu depois da última mudança e as
 /// opções devolvidas ao usuário, que ele mudou no meio do jogo e que um
 /// `configure` ou uma troca das janelas do tearing não replaneja até o modo
-/// sair. Um reload devolve tudo ao arquivo e o modo jogo reaplica tudo (D5).
+/// sair. Um reload devolve tudo ao arquivo e o modo jogo reaplica tudo (D5);
+/// um Hyprland reiniciado (outra instância) começa a sessão do zero. A opção
+/// devolvida sai do diário de vez: se o usuário a puser de novo no valor que
+/// o modo jogo tinha posto, ela fica assim ao sair (sem reaplicação no meio,
+/// o diário antigo a devolveria ao antes).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Session {
+    /// A instância do Hyprland em que o `seen` foi visto.
+    instance: Option<String>,
     seen: Vec<(String, OptionValue)>,
     released: BTreeSet<String>,
 }
@@ -121,6 +127,13 @@ async fn reconcile(
         .instance()
         .ok_or_else(|| HyprError::Unreachable("sem instância do Hyprland".into()))?;
     let prev = store.load().filter(|j| j.instance == instance);
+    if session.instance.as_deref() != Some(instance.as_str()) {
+        // Outra instância: os valores dela são os do arquivo, não do usuário.
+        *session = Session {
+            instance: Some(instance.clone()),
+            ..Session::default()
+        };
+    }
     if reload {
         session.released.clear();
     } else {
@@ -264,6 +277,11 @@ pub async fn restore(hypr: &dyn Hypr, store: &Store, journal: &Journal) -> Resul
     if !journal.entries.iter().all(ours) {
         let mut left = journal.clone();
         left.entries.retain(ours);
+        if left.is_empty() {
+            // Nada mais a desfazer: sem diário vazio segurando o daemon.
+            store.clear();
+            return Ok(());
+        }
         save(store, &left)?;
     }
     let mut changes: Vec<(&str, OptionValue)> = journal

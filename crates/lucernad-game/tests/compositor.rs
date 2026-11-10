@@ -465,3 +465,28 @@ async fn pending_restore_keeps_a_later_user_choice() {
     assert_eq!(h.option(VRR), Some(Int(0)));
     assert_eq!(store.load(), None);
 }
+
+#[tokio::test]
+async fn hyprland_restart_mid_game_is_not_a_user_change() {
+    // O Hyprland reinicia com o modo ligado: a instância nova tem os valores
+    // do arquivo, que não são escolha do usuário no meio do jogo.
+    let (_d, store) = store();
+    let h = FakeHypr::new();
+    let mut sess = Session::default();
+    let s = GameSettings::default();
+    apply(&h, &store, &s, &[], &mut sess).await.unwrap();
+    h.set_instance(Some("fake_2"));
+    for (k, v) in default_options() {
+        h.set_option(&k, v);
+    }
+    let j = apply(&h, &store, &s, &[], &mut sess)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(sess.released().is_empty());
+    assert_eq!(j.instance, "fake_2");
+    assert_eq!(h.option(ANIM), Some(Bool(false)), "reaplicado");
+    assert_eq!(h.option(BLUR), Some(Bool(false)));
+    restore(&h, &store, &j).await.unwrap();
+    assert_eq!(h.options(), default_options());
+}
