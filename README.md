@@ -249,6 +249,8 @@ Veja a pasta [`docs/`](docs/):
 
 - [`docs/proposta.md`](docs/proposta.md)
 
+O que falta fazer está em [`lucernad — Pendências.md`](<lucernad — Pendências.md>).
+
 ## Repositório
 
 A branch `main` é protegida por um ruleset igual ao do `lucerna-shell`: PR obrigatório, conversas resolvidas, só merge commit, sem deleção nem force push. Os checks `fmt`, `clippy` e `test` são obrigatórios no ruleset.
