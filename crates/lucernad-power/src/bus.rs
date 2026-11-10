@@ -44,6 +44,10 @@ pub const DBUS_TIMEOUT: Duration = Duration::from_secs(2);
 /// Sem o D-Bus do sistema, de quanto em quanto tempo os perfis tentam de novo.
 pub const PROFILES_RETRY: Duration = Duration::from_secs(30);
 
+/// Depois de uma leitura incerta dos perfis (um erro ou um prazo estourado
+/// no meio), em quanto tempo ela é refeita.
+pub const PROFILES_READ_RETRY: Duration = Duration::from_secs(2);
+
 /// O máximo de pontos do histórico publicados (os mais novos).
 pub const MAX_POINTS: usize = 500;
 
@@ -182,7 +186,8 @@ pub trait PowerBus: Send + Sync + 'static {
 
     /// Os perfis: manda o estado atual e cada mudança (o serviço subir, cair
     /// ou mudar a lista). Sem D-Bus, tenta de novo a cada
-    /// [`PROFILES_RETRY`]. Largar o receptor encerra a tarefa. Precisa de um
+    /// [`PROFILES_RETRY`]; uma leitura que falha, a cada
+    /// [`PROFILES_READ_RETRY`]. Largar o receptor encerra a tarefa. Precisa de um
     /// runtime do `tokio`.
     fn watch_profiles(&self) -> UnboundedReceiver<Profiles>;
 }
@@ -487,10 +492,11 @@ async fn follow_on(
         }
     }
     // Os sinais assinados antes da leitura: nenhuma mudança fica no meio.
-    // Uma leitura incerta (`None`) não publica: fica o último estado.
-    if let Some(now) = current_profiles(conn).await {
-        publish(tx, last, now);
-    }
+    // Uma leitura incerta (`None`) não publica (fica o último estado) e é
+    // refeita em [`PROFILES_READ_RETRY`], sem esperar um sinal: sem isso, uma
+    // primeira leitura que falha deixaria os perfis sem estado até o serviço
+    // mudar.
+    let mut certain = read_profiles(conn, tx, last).await;
     loop {
         tokio::select! {
             () = tx.closed() => return Ended::Closed,
@@ -498,11 +504,27 @@ async fn follow_on(
                 if !alive {
                     return Ended::Lost;
                 }
-                if let Some(now) = current_profiles(conn).await {
-                    publish(tx, last, now);
-                }
+                certain = read_profiles(conn, tx, last).await;
+            }
+            () = tokio::time::sleep(PROFILES_READ_RETRY), if !certain => {
+                certain = read_profiles(conn, tx, last).await;
             }
         }
+    }
+}
+
+/// Lê os perfis e publica se a leitura foi certa; diz se foi.
+async fn read_profiles(
+    conn: &Connection,
+    tx: &UnboundedSender<Profiles>,
+    last: &mut Option<Profiles>,
+) -> bool {
+    match current_profiles(conn).await {
+        Some(now) => {
+            publish(tx, last, now);
+            true
+        }
+        None => false,
     }
 }
 

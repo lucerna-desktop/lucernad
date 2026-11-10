@@ -487,3 +487,33 @@ async fn profiles_follow_the_service() {
     // Largar o receptor encerra a tarefa; o serviço não precisa saber.
     drop(rx);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "só no D-Bus isolado (tests/isolado.sh)"]
+async fn profiles_retry_a_failed_first_read() {
+    isolated();
+    // O nome tem dono, mas o objeto ainda não existe: a primeira leitura
+    // falha (incerta) e nada é publicado.
+    let service = Builder::system()
+        .unwrap()
+        .name(UPOWER_PROFILES)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let power = ZbusPower::system();
+    let mut rx = power.watch_profiles();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(rx.try_recv().is_err(), "a leitura incerta não publica");
+
+    // O objeto aparece sem sinal nenhum (nem NameOwnerChanged nem
+    // PropertiesChanged): a nova tentativa acha o estado.
+    let all = names(&["power-saver", "balanced", "performance"]);
+    service
+        .object_server()
+        .at(UPOWER_PROFILES_PATH, UpowerProfiles { names: all })
+        .await
+        .unwrap();
+    let start = tokio::time::timeout(WAIT, rx.recv()).await.unwrap();
+    assert_eq!(start, Some(profiles(true, true)));
+}
