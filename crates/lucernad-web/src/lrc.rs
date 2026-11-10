@@ -3,7 +3,7 @@
 //! Texto vindo de fora, então tudo tem limite: [`LINES_MAX`] linhas, até
 //! [`LINE_CHARS_MAX`] caracteres cada e [`TEXT_BYTES_MAX`] bytes de texto
 //! somado. O que passa disso cai (a linha que estouraria a soma cai com as
-//! seguintes). Caracteres de controle são removidos.
+//! seguintes). Caracteres de controle e os formatadores bidi são removidos.
 
 use serde_json::{Value, json};
 
@@ -130,12 +130,22 @@ fn parse_offset(tag: &str) -> Option<f64> {
     value.parse::<i64>().ok().map(|v| v as f64)
 }
 
-/// Tira os caracteres de controle e as pontas, e corta em
-/// [`LINE_CHARS_MAX`] caracteres sem copiar o resto.
+/// Os formatadores bidi (Cf): as marcas (`LRM`, `RLM`, `ALM`), os
+/// encaixes (`LRE`…`PDF`) e os isolamentos (`LRI`…`PDI`). Os outros Cf, como
+/// o ZWJ dos emojis, ficam.
+pub(crate) fn is_bidi_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Tira os caracteres de controle, os formatadores bidi e as pontas, e corta
+/// em [`LINE_CHARS_MAX`] caracteres sem copiar o resto.
 fn clean(s: &str) -> String {
     let text: String = s
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !is_bidi_format(*c))
         .skip_while(|c| c.is_whitespace())
         .take(LINE_CHARS_MAX)
         .collect();

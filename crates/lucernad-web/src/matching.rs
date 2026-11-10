@@ -3,6 +3,8 @@
 
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
+use crate::lrc::is_bidi_format;
+
 /// Diferença máxima de duração (em segundos) entre o pedido e a fonte.
 pub const DURATION_TOLERANCE: f64 = 2.0;
 
@@ -32,13 +34,16 @@ impl Track {
     }
 }
 
-/// NFD sem marcas combinantes, minúsculas, o que não é letra nem número vira
-/// espaço e os espaços são juntados.
+/// Sem os formatadores bidi, minúsculas, NFD sem marcas combinantes (nessa
+/// ordem: o `İ` minúsculo é `i` + ponto combinante), o que não é letra nem
+/// número vira espaço e os espaços são juntados.
 pub fn normalize(s: &str) -> String {
     let mapped: String = s
+        .chars()
+        .filter(|c| !is_bidi_format(*c))
+        .flat_map(char::to_lowercase)
         .nfd()
         .filter(|c| !is_combining_mark(*c))
-        .flat_map(char::to_lowercase)
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect();
     mapped.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -87,14 +92,26 @@ fn strip_groups(s: &str) -> String {
     out
 }
 
+/// Os separadores de um sufixo no fim do título: o hífen comum, o meia-risca
+/// e o travessão, com espaço dos dois lados.
+const SUFFIX_DASHES: &[&str] = &[" - ", " – ", " — "];
+
+/// O último separador de sufixo: onde começa e onde acaba.
+fn last_dash(title: &str) -> Option<(usize, usize)> {
+    SUFFIX_DASHES
+        .iter()
+        .filter_map(|d| title.rfind(d).map(|i| (i, i + d.len())))
+        .max()
+}
+
 /// O título normalizado e sem os sufixos que só mudam a gravação.
 pub fn title_key(s: &str) -> String {
     let mut title = strip_groups(s);
-    while let Some(i) = title.rfind(" - ") {
-        if !is_suffix(&normalize(&title[i + 3..])) {
+    while let Some((start, end)) = last_dash(&title) {
+        if !is_suffix(&normalize(&title[end..])) {
             break;
         }
-        title.truncate(i);
+        title.truncate(start);
     }
     let tokens: Vec<&str> = title.split_whitespace().collect();
     let cut = tokens
