@@ -112,3 +112,54 @@ fn writer_delivers_everything_and_closes() {
     assert_eq!(got, Ok(expected));
     thread.join().expect("a thread").expect("escrever tudo");
 }
+
+/// Se o fd está não bloqueante.
+fn nonblocking(fd: &impl std::os::fd::AsFd) -> bool {
+    rustix::fs::fcntl_getfl(fd)
+        .unwrap()
+        .contains(rustix::fs::OFlags::NONBLOCK)
+}
+
+#[test]
+fn writer_gives_back_the_blocking_mode() {
+    // O fd é de quem cola (a mesma descrição de arquivo): o modo volta como
+    // estava, deu certo ou não.
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    let reading =
+        thread::spawn(move || read_pipe(reader, 1 << 20, Instant::now() + Duration::from_secs(3)));
+    write_pipe(&writer, b"colado", Instant::now() + Duration::from_secs(3)).expect("escrever");
+    assert!(!nonblocking(&writer));
+    drop(writer);
+    assert_eq!(reading.join().unwrap(), Ok(b"colado".to_vec()));
+
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    let data = vec![1u8; 1 << 20];
+    let err = write_pipe(&writer, &data, Instant::now() + Duration::from_millis(50))
+        .expect_err("o leitor não lê");
+    assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    assert!(!nonblocking(&writer));
+    drop(reader);
+}
+
+#[test]
+fn full_pipe_waits_for_the_reader() {
+    // Mais que o buffer do pipe (64 KiB) e quem cola só lê depois: a escrita
+    // dá `WouldBlock`, espera o `POLLOUT` e termina.
+    let (mut reader, writer) = std::io::pipe().expect("pipe");
+    let data: Vec<u8> = (0..(1u32 << 20)).map(|i| (i % 253) as u8).collect();
+    let expected = data.clone();
+    let late = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(100));
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        got
+    });
+    let start = Instant::now();
+    write_pipe(writer, &data, start + Duration::from_secs(3)).expect("escrever tudo");
+    assert!(
+        start.elapsed() >= Duration::from_millis(90),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(late.join().unwrap(), expected);
+}

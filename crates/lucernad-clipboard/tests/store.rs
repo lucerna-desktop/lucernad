@@ -64,6 +64,13 @@ fn ids(page: &Page) -> Vec<i64> {
         .collect()
 }
 
+fn previews(page: &Page) -> Vec<&str> {
+    page.items
+        .iter()
+        .map(|i| i["preview"].as_str().unwrap_or(""))
+        .collect()
+}
+
 fn item(page: &Page, id: i64) -> &Value {
     page.items
         .iter()
@@ -734,4 +741,89 @@ fn removed_items_leave_no_bytes_on_disk() {
     assert_eq!(on_disk(&dir, b"fica no hist"), Vec::<String>::new());
     assert_eq!(ids(&all(&store)), [kept]);
     assert_eq!(search(&store, "senha").total, 0);
+}
+
+#[test]
+fn evicted_items_leave_no_bytes_on_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("clipboard");
+    let mut store = Store::open(Origin::Disk(dir.clone()), 1).unwrap();
+    add(&mut store, t("cortada-789 pelo limite"), 1);
+    assert!(
+        !on_disk(&dir, b"cortada-789").is_empty(),
+        "o teste enxerga o texto"
+    );
+    // A segunda cópia passa do limite: a primeira sai na mesma transação.
+    add(&mut store, t("a que fica"), 2);
+    assert_eq!(on_disk(&dir, b"cortada-789"), Vec::<String>::new());
+
+    // A troca do limite também corta.
+    store.set_limit(100).unwrap();
+    add(&mut store, t("cortada-012 pela troca"), 3);
+    add(&mut store, t("a mais nova"), 4);
+    assert!(!on_disk(&dir, b"cortada-012").is_empty());
+    store.set_limit(1).unwrap();
+    assert_eq!(on_disk(&dir, b"cortada-012"), Vec::<String>::new());
+    assert_eq!(previews(&all(&store)), ["a mais nova"]);
+}
+
+#[test]
+fn history_from_before_secure_delete_is_vacuumed_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("clipboard");
+    let mut store = disk_at(&dir);
+    let (id, _) = add(&mut store, t("antiga-345 apagada sem zerar"), 1);
+    add(&mut store, t("fica no histórico"), 2);
+    drop(store);
+    // Um histórico de antes: apagado sem o `secure_delete` (nem o do FTS) e
+    // sem a marca da limpeza.
+    let conn = rusqlite::Connection::open(dir.join("history.db")).unwrap();
+    conn.pragma_update(None, "secure_delete", "OFF").unwrap();
+    conn.execute(
+        "INSERT INTO items_fts(items_fts, rank) VALUES ('secure-delete', 0)",
+        [],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM items WHERE id = ?1", [id])
+        .unwrap();
+    conn.execute("DROP TABLE meta", []).unwrap();
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+        .unwrap();
+    drop(conn);
+    assert!(
+        !on_disk(&dir, b"antiga-345").is_empty(),
+        "o apagado sem zerar sobra no banco"
+    );
+
+    let store = disk_at(&dir);
+    assert_eq!(on_disk(&dir, b"antiga-345"), Vec::<String>::new());
+    assert_eq!(previews(&all(&store)), ["fica no histórico"]);
+    assert_eq!(search(&store, "histórico").total, 1);
+    assert_eq!(search(&store, "antiga").total, 0);
+    drop(store);
+    // A marca fica: a próxima abertura não refaz a limpeza.
+    let conn = rusqlite::Connection::open(dir.join("history.db")).unwrap();
+    let marked: i64 = conn
+        .query_row("SELECT COUNT(*) FROM meta", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(marked, 1);
+}
+
+#[test]
+fn busy_checkpoint_does_not_fail_the_removal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("clipboard");
+    let mut store = disk_at(&dir);
+    let (id, _) = add(&mut store, t("apagado com leitor aberto"), 1);
+    add(&mut store, t("fica"), 2);
+    // Outro leitor com uma leitura aberta: o checkpoint volta ocupado
+    // (depois do `busy_timeout`, 5 s).
+    let reader = rusqlite::Connection::open(dir.join("history.db")).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(store.remove(id), Ok(true));
+    reader.execute_batch("COMMIT").unwrap();
+    assert_eq!(previews(&all(&store)), ["fica"]);
 }

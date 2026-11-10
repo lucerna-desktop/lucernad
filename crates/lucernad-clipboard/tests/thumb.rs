@@ -93,3 +93,26 @@ fn sniff_reads_the_signature() {
     assert_eq!(sniff(&jpeg_bytes(2, 2)), Some("image/jpeg"));
     assert_eq!(sniff(b"%PDF-1.7"), None);
 }
+
+#[test]
+fn big_rotated_image_is_reduced_then_turned() {
+    // O degradê: o vermelho cresce para a direita, o verde para baixo.
+    let pixel = |png: &[u8], x: u32, y: u32| {
+        let img = image::load_from_memory(png).unwrap().to_rgb8();
+        let p = img.get_pixel(x, y);
+        (p[0], p[1])
+    };
+    // Orientação 6 (90° no horário): o canto de baixo à esquerda vai para o
+    // de cima à esquerda.
+    let t = thumbnail(&jpeg_bytes_oriented(800, 400, 6), "image/jpeg").unwrap();
+    assert_eq!((t.width, t.height), (400, 800));
+    assert_eq!(decoded_size(&t.png), (136, 272));
+    let (red, green) = pixel(&t.png, 2, 2);
+    assert!(red < 40 && green > 215, "({red}, {green})");
+    // Orientação 8 (90° no anti-horário): o de cima à direita vai para lá.
+    let t = thumbnail(&jpeg_bytes_oriented(800, 400, 8), "image/jpeg").unwrap();
+    assert_eq!((t.width, t.height), (400, 800));
+    assert_eq!(decoded_size(&t.png), (136, 272));
+    let (red, green) = pixel(&t.png, 2, 2);
+    assert!(red > 215 && green < 40, "({red}, {green})");
+}
