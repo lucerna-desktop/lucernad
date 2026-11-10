@@ -498,8 +498,12 @@ impl Run {
                 let cache = &mut self.cache;
                 triggers(&w, &ws, |pid| cache.is_game(proc, pid), &self.settings)
             }
-            // Sem Hyprland (o socket sumiu): sem gatilhos.
-            Err(HyprError::Unreachable(_)) => Vec::new(),
+            // Sem Hyprland (o socket sumiu): sem gatilhos, mas a trava
+            // "desligado na mão" fica até a próxima leitura de verdade.
+            Err(HyprError::Unreachable(_)) => {
+                self.machine.lost(Instant::now());
+                return;
+            }
             // Um soluço (prazo, resposta estranha): ficam os gatilhos de
             // antes, sem soltar a trava "desligado na mão".
             Err(e) => {

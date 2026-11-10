@@ -652,6 +652,32 @@ async fn clients_failure_keeps_the_manual_off_latch() {
 }
 
 #[tokio::test]
+async fn lost_hyprland_keeps_the_manual_off_latch() {
+    let r = rig();
+    let c = r.client().await;
+    r.call(&c, "game.configure", json!({})).await;
+    r.a_game(500);
+    r.windows(vec![win("0xg", 500, "dota2", 0)]);
+    state_until(&c, active).await;
+    r.call(&c, "game.set", json!({"on": false})).await;
+    state_until(&c, |v| v["manual"] == json!("off")).await;
+    // O socket some por mais que a espera da saída: sem ver as janelas, a
+    // trava fica.
+    r.hypr.set_unreachable(true);
+    r.hypr.emit("openwindow", "x");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let s = state_until(&c, |_| true).await;
+    assert_eq!(s["manual"], json!("off"), "{s}");
+    // O Hyprland volta com o jogo ainda aberto: continua desligado.
+    r.hypr.set_unreachable(false);
+    r.hypr.emit("openwindow", "x");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let s = state_until(&c, |_| true).await;
+    assert!(!active(&s), "religou contra o pedido: {s}");
+    assert_eq!(s["manual"], json!("off"));
+}
+
+#[tokio::test]
 async fn loop_panic_still_undoes_the_effects() {
     let r = rig();
     let c = r.client().await;
