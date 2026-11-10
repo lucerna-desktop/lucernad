@@ -74,6 +74,20 @@ fn silence_is_zero() {
 }
 
 #[test]
+fn idle_is_a_silent_frame_without_the_fft() {
+    let tone = sine(1000.0, 48_000, 0.5, LOW_FFT_SIZE + 30 * 800);
+    let mut a = Analyzer::new(48_000);
+    let mut b = Analyzer::new(48_000);
+    run(&mut a, &tone, 800, 30);
+    run(&mut b, &tone, 800, 30);
+    // O player pausado: o quadro de silêncio e o `idle` caem iguais até zero.
+    for _ in 0..120 {
+        assert_eq!(a.frame(&[0.0; LOW_FFT_SIZE]), b.idle());
+    }
+    assert_eq!(b.idle(), [0.0; BANDS]);
+}
+
+#[test]
 fn white_noise_spreads() {
     let signal: Vec<f32> = noise(1, LOW_FFT_SIZE + 120 * 800)
         .iter()

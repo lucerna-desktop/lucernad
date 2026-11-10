@@ -488,23 +488,29 @@ struct Capture {
 }
 
 impl Capture {
-    /// Guarda as amostras de um nó capturado; (re)cria a análise se a taxa
-    /// mudou.
+    /// Guarda as amostras de um nó capturado.
     fn push(&mut self, serial: u64, rate: u32, mono: &[f32]) {
-        if !self.matched.contains(&serial) {
-            return;
-        }
-        self.rings.push(serial, mono, std::time::Instant::now());
-        if self.analyzer.as_ref().is_none_or(|(r, _)| *r != rate) {
-            self.analyzer = Some((rate, Analyzer::new(rate)));
+        if self.matched.contains(&serial) {
+            self.rings
+                .push(serial, rate, mono, std::time::Instant::now());
         }
     }
 
-    /// O quadro de agora, com 3 casas; `None` antes da primeira amostra.
+    /// O quadro de agora, com 3 casas; `None` antes da primeira amostra. A
+    /// análise é (re)criada quando a taxa da janela muda; sem amostra fresca
+    /// (o player pausado), as barras caem sem as FFTs.
     fn frame(&mut self) -> Option<Vec<f64>> {
-        let (_, analyzer) = self.analyzer.as_mut()?;
-        let window = self.rings.window(std::time::Instant::now());
-        let frame = analyzer.frame(&window);
+        let now = std::time::Instant::now();
+        let frame = match self.rings.rate(now) {
+            Some(rate) => {
+                if self.analyzer.as_ref().is_none_or(|(r, _)| *r != rate) {
+                    self.analyzer = Some((rate, Analyzer::new(rate)));
+                }
+                let (_, analyzer) = self.analyzer.as_mut()?;
+                analyzer.frame(&self.rings.window(now))
+            }
+            None => self.analyzer.as_mut()?.1.idle(),
+        };
         Some(
             frame
                 .iter()
