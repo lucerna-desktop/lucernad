@@ -738,7 +738,10 @@ fn past_days_are_dropped_by_the_city_date() {
     assert_eq!(v["sunset"], json!("2026-10-25T18:03"));
     assert!(v["daily"][0].get("sunrise").is_none());
     assert_eq!(v["current"]["isDay"], json!(true));
-    assert_eq!(v["daily"][0]["precipitation"], json!(70.0));
+    // As porcentagens saem inteiras no tópico (`58`, não `58.0`).
+    assert_eq!(v["daily"][0]["precipitation"], json!(70));
+    assert_eq!(v["current"]["humidity"], json!(58));
+    assert!(v.to_string().contains(r#""humidity":58,"#), "{v}");
 
     // 2026-10-31T12:00Z: tudo no passado.
     let v = f.view(at(1_793_448_000));

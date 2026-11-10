@@ -93,7 +93,7 @@ Roda **só com assinante** (a letra, só com assinante de `web.lyrics`; o clima,
 | Tópico | O que traz | Quando muda |
 | --- | --- | --- |
 | `web.lyrics` | `{"key","state","synced","lines":[{"time","text"}],"source","url"?,"error"?}`: `state` `found`, `searching`, `none` ou `error`; `time` em segundos (`null` na letra sem tempo); `source` `lrclib` ou `vagalume` (o `url` só com o Vagalume); `null` até o primeiro `web.track` com assinante | a cada faixa e a cada resultado |
-| `web.weather` | `{"location","state","updatedAt","current","daily","sunrise","sunset","error"?}`: `state` `none`, `loading`, `ready` ou `error` (com os dados guardados); `daily` só de hoje em diante, na data local da cidade; °C, km/h e %; `null` até o primeiro `web.configure` | a cada atualização |
+| `web.weather` | `{"location","state","updatedAt","current","daily","sunrise","sunset","error"?}`: `state` `none`, `loading`, `ready` ou `error` (com os dados guardados); `loading` também sem assinante, com a cidade sem previsão guardada (a busca sai quando alguém assina); `daily` só de hoje em diante, na data local da cidade; °C, km/h e % (a umidade e a chance de chuva, `precipitation`, em inteiros); `null` até o primeiro `web.configure` | a cada atualização |
 | `web.status` | `{"available","error","online"}`; `available` `false` com o motivo se o módulo não puder rodar | quando o estado ou a conectividade muda |
 
 Métodos:
