@@ -84,7 +84,8 @@ impl PipeWire {
 
     /// Espera a thread da sessão anterior terminar, até o `timeout`: com as
     /// duas ao mesmo tempo, os fluxos da velha ainda estariam no grafo
-    /// quando a nova liga os dela.
+    /// quando a nova liga os dela. O tempo gasto aqui sai do prazo do
+    /// `ready` no `open`, para o total caber no `OPEN_TIMEOUT` do módulo.
     fn wait_previous(&self) {
         let previous = self
             .previous
@@ -104,6 +105,7 @@ impl Backend for PipeWire {
     }
 
     fn open(&self) -> Result<Session, String> {
+        let started = Instant::now();
         self.wait_previous();
         let (events_tx, events) = mpsc::unbounded_channel();
         let (commands, commands_rx) = pw::channel::channel();
@@ -121,7 +123,8 @@ impl Backend for PipeWire {
         *self.previous.lock().unwrap_or_else(|e| e.into_inner()) = Some(done_rx);
 
         // A thread tem o prazo dela; este é a reserva se ela travar antes.
-        match ready.recv_timeout(timeout + Duration::from_secs(1)) {
+        let reserve = (timeout + Duration::from_secs(1)).saturating_sub(started.elapsed());
+        match ready.recv_timeout(reserve) {
             Ok(Ok(())) => Ok(Session {
                 events,
                 control: Box::new(PipeWireControl { commands }),
@@ -301,11 +304,17 @@ impl<S: Stream, B> State<S, B> {
         let failures = self.failures.entry(serial).or_default();
         *failures += 1;
         let delay = reopen_delay(*failures);
-        if *failures == 1 || (delay == MAX_REOPEN_DELAY && reopen_delay(*failures - 1) < delay) {
-            let secs = format!("{}", delay.as_secs_f32()).replace('.', ",");
+        let secs = |d: Duration| format!("{}", d.as_secs_f32()).replace('.', ",");
+        if *failures == 1 {
             eprintln!(
-                "lucernad: a captura do nó {serial} não ligou ({} vez(es)); nova tentativa a cada {secs} s",
-                failures
+                "lucernad: a captura do nó {serial} não ligou; nova tentativa em {} s, dobrando até {} s",
+                secs(delay),
+                secs(MAX_REOPEN_DELAY)
+            );
+        } else if delay == MAX_REOPEN_DELAY && reopen_delay(*failures - 1) < delay {
+            eprintln!(
+                "lucernad: a captura do nó {serial} segue sem ligar; nova tentativa a cada {} s",
+                secs(delay)
             );
         }
         self.retry.insert(serial, now + delay);
@@ -324,6 +333,9 @@ impl<S: Stream, B> State<S, B> {
 
         let mut failed = Vec::new();
         for (&serial, capture) in &self.captures {
+            // A falha vem antes: um fluxo que rodou e caiu no mesmo tique
+            // não zera a conta (de propósito: um alvo que pisca não volta
+            // aos 0,5 s).
             if capture.failed() {
                 failed.push(serial);
             } else if capture.streamed() {
