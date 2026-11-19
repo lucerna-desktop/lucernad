@@ -28,19 +28,26 @@ async fn mute_peer(peers: &Mutex<Vec<Connection>>) -> zbus::Result<Connection> {
     client
 }
 
-#[tokio::test]
-async fn a_bus_that_stops_answering_is_reconnected() {
+/// Um `SessionBus` com o prazo `timeout` sobre pares mudos, e a conta das
+/// conexões abertas.
+fn mute_bus(timeout: Duration) -> (SessionBus, Arc<AtomicUsize>) {
     let connects = Arc::new(AtomicUsize::new(0));
     let peers = Arc::new(Mutex::new(Vec::new()));
     let (count, kept) = (connects.clone(), peers.clone());
     let bus = SessionBus::with_connect(
-        Duration::from_millis(100),
+        timeout,
         Box::new(move || {
             count.fetch_add(1, Ordering::SeqCst);
             let kept = kept.clone();
             Box::pin(async move { mute_peer(&kept).await })
         }),
     );
+    (bus, connects)
+}
+
+#[tokio::test]
+async fn a_bus_that_stops_answering_is_reconnected() {
+    let (bus, connects) = mute_bus(Duration::from_millis(100));
     let only_name = Identity {
         name: SPOTIFY.into(),
         ..Identity::default()
@@ -49,5 +56,18 @@ async fn a_bus_that_stops_answering_is_reconnected() {
     assert_eq!(connects.load(Ordering::SeqCst), 1);
     // O prazo do barramento estourou: a próxima identificação reconecta.
     assert_eq!(bus.identify(SPOTIFY).await, only_name);
+    assert_eq!(connects.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn the_outer_deadline_still_reconnects() {
+    // Como no módulo: o mesmo prazo por fora do `identify`, que começa antes
+    // do de dentro e vence primeiro.
+    let deadline = Duration::from_millis(100);
+    let (bus, connects) = mute_bus(deadline);
+    let outer = tokio::time::timeout(deadline, bus.identify(SPOTIFY)).await;
+    assert!(outer.is_err(), "o prazo de fora venceu primeiro");
+    assert_eq!(connects.load(Ordering::SeqCst), 1);
+    let _ = tokio::time::timeout(deadline, bus.identify(SPOTIFY)).await;
     assert_eq!(connects.load(Ordering::SeqCst), 2);
 }

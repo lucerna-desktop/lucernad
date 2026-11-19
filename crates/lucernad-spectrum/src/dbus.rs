@@ -45,6 +45,35 @@ pub struct SessionBus {
     /// A conexão guardada; volta a `None` depois de um erro de E/S ou do
     /// prazo do barramento estourado, para a próxima chamada refazer.
     conn: Mutex<Option<Connection>>,
+    /// A conexão que não respondeu o PID no prazo, marcada sem `await` (um
+    /// prazo de fora pode largar a chamada antes do de dentro): a próxima
+    /// [`SessionBus::connection`] a esquece se ainda for a guardada.
+    stale: std::sync::Mutex<Option<ConnId>>,
+}
+
+/// O que identifica uma conexão.
+type ConnId = (Option<String>, String);
+
+fn conn_id(conn: &Connection) -> ConnId {
+    (
+        conn.unique_name().map(|n| n.to_string()),
+        conn.server_guid().to_string(),
+    )
+}
+
+/// Marca a conexão como sem resposta ao cair, se não for desarmado: vale
+/// para o prazo de dentro e para o futuro largado por um prazo de fora.
+struct StaleOnDrop<'a> {
+    stale: &'a std::sync::Mutex<Option<ConnId>>,
+    conn: Option<ConnId>,
+}
+
+impl Drop for StaleOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.conn.take() {
+            *self.stale.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
+        }
+    }
 }
 
 impl SessionBus {
@@ -61,11 +90,16 @@ impl SessionBus {
             timeout,
             connect,
             conn: Mutex::new(None),
+            stale: std::sync::Mutex::new(None),
         }
     }
 
     async fn connection(&self) -> Option<Connection> {
         let mut conn = self.conn.lock().await;
+        let stale = self.stale.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if stale.is_some() && conn.as_ref().map(conn_id) == stale {
+            *conn = None;
+        }
         if let Some(conn) = conn.as_ref() {
             return Some(conn.clone());
         }
@@ -93,27 +127,20 @@ impl SessionBus {
                 .await
                 .map_err(zbus::Error::from)
         };
-        let Ok(result) = timeout(self.timeout, call).await else {
-            self.forget(conn).await;
-            return None;
+        // Armada até a resposta: o prazo estourado aqui ou o futuro largado
+        // por um prazo de fora marcam a conexão.
+        let mut armed = StaleOnDrop {
+            stale: &self.stale,
+            conn: Some(conn_id(conn)),
         };
+        let result = timeout(self.timeout, call).await.ok()?;
+        armed.conn = None;
         match result {
             Ok(pid) => Some(pid),
             Err(err) => {
                 self.forget_on_io(&err).await;
                 None
             }
-        }
-    }
-
-    /// Esquece a conexão guardada se ainda for `conn` (outra chamada pode
-    /// já ter refeito).
-    async fn forget(&self, conn: &Connection) {
-        let mut guard = self.conn.lock().await;
-        if guard.as_ref().is_some_and(|c| {
-            c.unique_name() == conn.unique_name() && c.server_guid() == conn.server_guid()
-        }) {
-            *guard = None;
         }
     }
 
