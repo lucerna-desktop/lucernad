@@ -122,7 +122,8 @@ impl Forecast {
     /// `updatedAt`: `daily` só de hoje em diante (a data local da cidade,
     /// `now + utc_offset`), sem o nascer/pôr por dia; `sunrise`/`sunset` do
     /// dia de hoje, ou `null`; a umidade e a chance de chuva em porcentagem
-    /// inteira (o cache guarda como veio).
+    /// inteira (o cache guarda como veio); `utcOffset` é o fuso da cidade em
+    /// segundos (o shell tira a data da cidade dele).
     pub fn view(&self, now: SystemTime) -> Value {
         let secs = now
             .duration_since(UNIX_EPOCH)
@@ -150,6 +151,7 @@ impl Forecast {
             "daily": daily,
             "sunrise": current_day.and_then(|d| d.sunrise.clone()),
             "sunset": current_day.and_then(|d| d.sunset.clone()),
+            "utcOffset": self.utc_offset,
         })
     }
 }

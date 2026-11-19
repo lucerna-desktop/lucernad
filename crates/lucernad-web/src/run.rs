@@ -388,7 +388,7 @@ impl Loop {
                 publish_changed(
                     &self.topics.weather,
                     json!({"location": null, "state": "none", "updatedAt": null,
-                           "current": null, "daily": [], "sunrise": null, "sunset": null}),
+                           "current": null, "daily": [], "sunrise": null, "sunset": null, "utcOffset": null}),
                 );
             }
             (Some(old), Some(new)) if old.place_key() == new.place_key() => {
@@ -552,7 +552,7 @@ impl Loop {
                 v
             }
             None => json!({"updatedAt": null, "current": null, "daily": [],
-                           "sunrise": null, "sunset": null}),
+                           "sunrise": null, "sunset": null, "utcOffset": null}),
         };
         v["location"] = location_json(loc);
         v["state"] = json!(state);

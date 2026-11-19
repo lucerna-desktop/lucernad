@@ -713,6 +713,13 @@ fn at(secs: u64) -> SystemTime {
 }
 
 #[test]
+fn view_carries_the_city_utc_offset() {
+    let f = weather::parse_forecast(&bytes(&forecast_body())).unwrap();
+    // O fuso da cidade (−4 h) em segundos, como o shell lê.
+    assert_eq!(f.view(at(1_792_980_000))["utcOffset"], json!(-14_400));
+}
+
+#[test]
 fn past_days_are_dropped_by_the_city_date() {
     let f = weather::parse_forecast(&bytes(&forecast_body())).unwrap();
     // 2026-10-26T02:00Z: ainda 25 na cidade (−4 h).

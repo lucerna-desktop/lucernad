@@ -849,7 +849,7 @@ async fn offline_and_no_link_send_nothing() {
     assert_eq!(
         weather,
         json!({"location": loc_json(&cacau()), "state": "error", "updatedAt": null,
-               "current": null, "daily": [], "sunrise": null, "sunset": null,
+               "current": null, "daily": [], "sunrise": null, "sunset": null, "utcOffset": null,
                "error": OFFLINE_WEATHER})
     );
 
