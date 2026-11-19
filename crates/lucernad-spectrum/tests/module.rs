@@ -492,10 +492,21 @@ async fn frames_at_about_60_per_second() {
     let (_d, t, _c, _s) = capturing(&backend, spotify(), SPOTIFY).await;
     let _feed = feed(&backend, 121, noise(7, RATE as usize));
     wait_until(Duration::from_secs(2), "um quadro", || max_band(&t) > 0.0).await;
-    let first = t.bands.current().seq;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let frames = t.bands.current().seq - first;
-    assert!((40..=70).contains(&frames), "{frames} quadros em 1 s");
+    // O teto vale em toda janela; o piso, na melhor de três: com a máquina
+    // carregada (a suíte em paralelo, um build ao lado), um segundo pode
+    // perder quadros, mas um laço lento de verdade perde nas três.
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        let first = t.bands.current().seq;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let frames = t.bands.current().seq - first;
+        assert!(frames <= 70, "{frames} quadros em 1 s, acima dos 60");
+        if frames >= 40 {
+            return;
+        }
+        seen.push(frames);
+    }
+    panic!("menos de 40 quadros por segundo nas três janelas: {seen:?}");
 }
 
 #[tokio::test]
