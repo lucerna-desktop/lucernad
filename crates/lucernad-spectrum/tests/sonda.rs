@@ -314,3 +314,23 @@ async fn capture_never_falls_back_to_the_microphone() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+
+#[tokio::test]
+#[ignore = "só no PipeWire isolado (tests/isolado.sh)"]
+async fn a_new_session_opens_after_the_old_one_ends() {
+    let backend = PipeWire::system();
+    let player = Player::start();
+    let mut session = backend.open().expect("abrir a sessão");
+    let node = player_node(&mut session).await;
+    session.control.capture(&[node.serial]);
+    expect_player_samples(&mut session, node.serial).await;
+    assert!(involves_capture(&links()));
+
+    // A sessão nova espera a thread da anterior desmontar: o fluxo velho já
+    // saiu do grafo quando ela abre.
+    drop(session);
+    let _again = backend.open().expect("reabrir a sessão");
+    let pairs = links();
+    assert!(!involves_capture(&pairs), "o fluxo velho ficou: {pairs:?}");
+    drop(player);
+}
