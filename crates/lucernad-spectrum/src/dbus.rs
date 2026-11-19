@@ -35,33 +35,75 @@ pub trait Bus: Send + Sync + 'static {
     fn identify<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Identity>;
 }
 
+/// Como o [`SessionBus`] abre a conexão.
+pub type Connect = Box<dyn Fn() -> BoxFuture<'static, zbus::Result<Connection>> + Send + Sync>;
+
 /// O D-Bus da sessão do usuário, pelo `zbus`.
 pub struct SessionBus {
     timeout: Duration,
-    /// A conexão guardada; volta a `None` depois de um erro de E/S, para a
-    /// próxima chamada refazer.
+    connect: Connect,
+    /// A conexão guardada; volta a `None` depois de um erro de E/S ou do
+    /// prazo do barramento estourado, para a próxima chamada refazer.
     conn: Mutex<Option<Connection>>,
+    /// A conexão que não respondeu o PID no prazo, marcada sem `await` (um
+    /// prazo de fora pode largar a chamada antes do de dentro): a próxima
+    /// [`SessionBus::connection`] a esquece se ainda for a guardada.
+    stale: std::sync::Mutex<Option<ConnId>>,
+}
+
+/// O que identifica uma conexão.
+type ConnId = (Option<String>, String);
+
+fn conn_id(conn: &Connection) -> ConnId {
+    (
+        conn.unique_name().map(|n| n.to_string()),
+        conn.server_guid().to_string(),
+    )
+}
+
+/// Marca a conexão como sem resposta ao cair, se não for desarmado: vale
+/// para o prazo de dentro e para o futuro largado por um prazo de fora.
+struct StaleOnDrop<'a> {
+    stale: &'a std::sync::Mutex<Option<ConnId>>,
+    conn: Option<ConnId>,
+}
+
+impl Drop for StaleOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.conn.take() {
+            *self.stale.lock().unwrap_or_else(|e| e.into_inner()) = Some(id);
+        }
+    }
 }
 
 impl SessionBus {
     /// Um barramento com `timeout` em cada chamada (a conexão, o PID e o
     /// `DesktopEntry`). Não conecta até o primeiro [`Bus::identify`].
     pub fn new(timeout: Duration) -> SessionBus {
+        SessionBus::with_connect(timeout, Box::new(|| Box::pin(Connection::session())))
+    }
+
+    /// O [`SessionBus::new`] com a conexão aberta por `connect` (nos testes,
+    /// uma conexão ponto a ponto).
+    pub fn with_connect(timeout: Duration, connect: Connect) -> SessionBus {
         SessionBus {
             timeout,
+            connect,
             conn: Mutex::new(None),
+            stale: std::sync::Mutex::new(None),
         }
     }
 
     async fn connection(&self) -> Option<Connection> {
         let mut conn = self.conn.lock().await;
+        let stale = self.stale.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if stale.is_some() && conn.as_ref().map(conn_id) == stale {
+            *conn = None;
+        }
         if let Some(conn) = conn.as_ref() {
             return Some(conn.clone());
         }
-        let fresh = timeout(self.timeout, Connection::session())
-            .await
-            .ok()?
-            .ok()?;
+        let fresh = timeout(self.timeout, (self.connect)()).await.ok()?.ok()?;
         *conn = Some(fresh.clone());
         Some(fresh)
     }
@@ -73,6 +115,10 @@ impl SessionBus {
         }
     }
 
+    /// O PID do dono de `name`, pelo próprio barramento. O prazo estourado
+    /// aqui é do barramento (travado ou com a conexão perdida sem erro de
+    /// E/S): a conexão é esquecida. O do `DesktopEntry` não, porque quem
+    /// responde é o player, e um player travado não diz nada da conexão.
     async fn owner_pid(&self, conn: &Connection, name: &BusName<'_>) -> Option<u32> {
         let call = async {
             let proxy = DBusProxy::new(conn).await?;
@@ -81,7 +127,15 @@ impl SessionBus {
                 .await
                 .map_err(zbus::Error::from)
         };
-        match timeout(self.timeout, call).await.ok()? {
+        // Armada até a resposta: o prazo estourado aqui ou o futuro largado
+        // por um prazo de fora marcam a conexão.
+        let mut armed = StaleOnDrop {
+            stale: &self.stale,
+            conn: Some(conn_id(conn)),
+        };
+        let result = timeout(self.timeout, call).await.ok()?;
+        armed.conn = None;
+        match result {
             Ok(pid) => Some(pid),
             Err(err) => {
                 self.forget_on_io(&err).await;

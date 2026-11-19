@@ -3,11 +3,12 @@
 //! método.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use lucerna_ipc::{Client, ClientError};
 use lucerna_service::ServerBuilder;
-use lucernad_core::ModuleTask;
+use lucernad_core::{Job, ModuleTask, spawn_thread};
 use lucernad_spectrum::analysis::BANDS;
 use lucernad_spectrum::backend::OutputNode;
 use lucernad_spectrum::testing::{FakeBackend, FakeBus, fake_config, noise, sine, testdata};
@@ -491,10 +492,21 @@ async fn frames_at_about_60_per_second() {
     let (_d, t, _c, _s) = capturing(&backend, spotify(), SPOTIFY).await;
     let _feed = feed(&backend, 121, noise(7, RATE as usize));
     wait_until(Duration::from_secs(2), "um quadro", || max_band(&t) > 0.0).await;
-    let first = t.bands.current().seq;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let frames = t.bands.current().seq - first;
-    assert!((40..=70).contains(&frames), "{frames} quadros em 1 s");
+    // O teto vale em toda janela; o piso, na melhor de três: com a máquina
+    // carregada (a suíte em paralelo, um build ao lado), um segundo pode
+    // perder quadros, mas um laço lento de verdade perde nas três.
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        let first = t.bands.current().seq;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let frames = t.bands.current().seq - first;
+        assert!(frames <= 70, "{frames} quadros em 1 s, acima dos 60");
+        if frames >= 40 {
+            return;
+        }
+        seen.push(frames);
+    }
+    panic!("menos de 40 quadros por segundo nas três janelas: {seen:?}");
 }
 
 #[tokio::test]
@@ -626,6 +638,62 @@ async fn switching_player_with_a_stuck_proc_drops_the_old_capture() {
     }
     spotify.abort();
 
+    unblock(&stat, text, false).await;
+    wait_until(Duration::from_secs(2), "a captura do Brave", || {
+        backend.capturing() == [178, 190]
+    })
+    .await;
+}
+
+/// As threads de casamento criadas pelo [`counting_spawn`].
+static SPAWNED: AtomicUsize = AtomicUsize::new(0);
+
+/// O `spawn_thread`, contando as threads em [`SPAWNED`].
+fn counting_spawn(job: Job) -> std::io::Result<()> {
+    SPAWNED.fetch_add(1, Ordering::SeqCst);
+    spawn_thread(job)
+}
+
+#[tokio::test]
+async fn a_stuck_proc_holds_one_thread_across_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let procfs = copy_proc(dir.path());
+    let backend = backend_with_nodes();
+    let bus = spotify().owner(BRAVE, 119549);
+    let cfg = SpectrumConfig {
+        procfs: procfs.clone(),
+        spawn: counting_spawn,
+        ..fake_config(backend.clone(), bus)
+    };
+    let (_d, path, _t, _s) = serve(cfg).await;
+    let c = client(&path).await;
+
+    // O casamento do Brave trava no /proc do dono.
+    let stat = procfs.join("119549/stat");
+    let text = block(&stat);
+    configure(&c, json!({ "player": BRAVE })).await.unwrap();
+    for _ in 0..4 {
+        c.subscribe(&["spectrum.bands"]).await.unwrap();
+        wait_until(Duration::from_secs(1), "a sessão", || {
+            backend.sessions() == 1
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        c.unsubscribe(&["spectrum.bands"]).await.unwrap();
+        wait_until(Duration::from_secs(1), "a sessão fechada", || {
+            backend.sessions() == 0
+        })
+        .await;
+    }
+    assert_eq!(
+        SPAWNED.load(Ordering::SeqCst),
+        1,
+        "cada sessão deixou uma thread presa"
+    );
+
+    // Destravado, o casamento preso termina (de uma sessão anterior, não
+    // vale) e o da sessão nova casa.
+    c.subscribe(&["spectrum.bands"]).await.unwrap();
     unblock(&stat, text, false).await;
     wait_until(Duration::from_secs(2), "a captura do Brave", || {
         backend.capturing() == [178, 190]

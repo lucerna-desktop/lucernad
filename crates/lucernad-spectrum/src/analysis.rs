@@ -6,7 +6,7 @@
 
 use std::f32::consts::TAU;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
@@ -76,15 +76,15 @@ pub fn band_of(freq: f32) -> Option<usize> {
 /// à direita se faltarem (o contrário do [`Analyzer::frame`], que usa as
 /// últimas e preenche à esquerda).
 pub fn magnitudes_db(window: &[f32]) -> Vec<f32> {
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(FFT_SIZE);
-    spectrum_db(fft.as_ref(), window)
-}
-
-/// Os módulos em dBFS dos `len/2 + 1` bins de uma FFT do tamanho de `fft`,
-/// sobre as primeiras amostras de `window` (zeros se faltarem).
-fn spectrum_db(fft: &dyn Fft<f32>, window: &[f32]) -> Vec<f32> {
-    spectrum_db_with(fft, &hann(fft.len()), window)
+    // O planejador e a janela, uma vez só no processo.
+    static PLAN: OnceLock<(Arc<dyn Fft<f32>>, Vec<f32>)> = OnceLock::new();
+    let (fft, hann) = PLAN.get_or_init(|| {
+        (
+            FftPlanner::<f32>::new().plan_fft_forward(FFT_SIZE),
+            hann(FFT_SIZE),
+        )
+    });
+    spectrum_db_with(fft.as_ref(), hann, window)
 }
 
 /// A janela de Hann de `size` amostras.
@@ -94,7 +94,9 @@ fn hann(size: usize) -> Vec<f32> {
         .collect()
 }
 
-/// O [`spectrum_db`] com a janela `hann` (do tamanho da FFT) já calculada.
+/// Os módulos em dBFS dos `len/2 + 1` bins de uma FFT do tamanho de `fft`,
+/// sobre as primeiras amostras de `window` (zeros se faltarem), com a janela
+/// `hann` (do tamanho da FFT) já calculada.
 fn spectrum_db_with(fft: &dyn Fft<f32>, hann: &[f32], window: &[f32]) -> Vec<f32> {
     let size = fft.len();
     let mut buf: Vec<Complex<f32>> = hann
@@ -372,5 +374,13 @@ impl Analyzer {
         let levels = self.layout.levels(&db, self.gain.reference_db);
         self.smoother
             .step(&self.layout.borrow_bass(&levels), FRAME_DT)
+    }
+
+    /// Um quadro de silêncio sem as FFTs (o player pausado, sem amostra
+    /// fresca): o mesmo do [`Analyzer::frame`] sobre zeros, em que todo bin
+    /// fica abaixo da referência mais baixa e todo nível vale zero.
+    pub fn idle(&mut self) -> [f32; BANDS] {
+        self.gain.step(MIN_DB, FRAME_DT);
+        self.smoother.step(&[0.0; BANDS], FRAME_DT)
     }
 }

@@ -7,8 +7,13 @@
 //! client com o nome do player, só com igualdade exata e só se todos os nós
 //! que casam vierem de um mesmo processo.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::fs::File;
+use std::io::Read;
+use std::os::unix::ffi::OsStringExt;
+use std::path::PathBuf;
+
+use rustix::fs::{Mode, OFlags, openat, readlinkat};
 
 use crate::backend::OutputNode;
 use crate::dbus::Identity;
@@ -61,24 +66,40 @@ impl ProcFs {
 
 impl Processes for ProcFs {
     fn get(&self, pid: u32) -> Option<Process> {
-        let dir = self.root.join(pid.to_string());
-        let stat = fs::read_to_string(dir.join("stat")).ok()?;
-        let ppid = parse_ppid(&stat)?;
-        Some(Process {
-            ppid,
-            exe: exe_name(&dir).unwrap_or_default(),
-        })
+        let dir = File::open(self.root.join(pid.to_string())).ok()?;
+        read_process(&dir)
     }
+}
+
+/// O processo da pasta `dir` do `/proc`, já aberta: o `stat` e o `exe` saem
+/// dela, não do caminho, então um PID reciclado entre as duas leituras não
+/// mistura dois processos (a pasta aberta de um processo que saiu só dá
+/// erro).
+pub fn read_process(dir: &File) -> Option<Process> {
+    let stat = read_at(dir, "stat")?;
+    let ppid = parse_ppid(&String::from_utf8_lossy(&stat))?;
+    Some(Process {
+        ppid,
+        exe: exe_name(dir).unwrap_or_default(),
+    })
+}
+
+/// O conteúdo do arquivo `name` dentro da pasta `dir`.
+fn read_at(dir: &File, name: &str) -> Option<Vec<u8>> {
+    let fd = openat(dir, name, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()).ok()?;
+    let mut bytes = Vec::new();
+    File::from(fd).read_to_end(&mut bytes).ok()?;
+    Some(bytes)
 }
 
 /// O nome do executável: o do arquivo apontado por `exe` e, sem ele, o do
 /// primeiro argumento do `cmdline`. O `comm` não serve: corta em 15
 /// caracteres (`plasma-browser-`).
-fn exe_name(dir: &Path) -> Option<String> {
-    let path = match fs::read_link(dir.join("exe")) {
-        Ok(path) => path,
+fn exe_name(dir: &File) -> Option<String> {
+    let path = match readlinkat(dir, "exe", Vec::new()) {
+        Ok(path) => PathBuf::from(OsString::from_vec(path.into_bytes())),
         Err(_) => {
-            let cmdline = fs::read(dir.join("cmdline")).ok()?;
+            let cmdline = read_at(dir, "cmdline")?;
             let first = cmdline.split(|&b| b == 0).next()?;
             PathBuf::from(String::from_utf8_lossy(first).into_owned())
         }
